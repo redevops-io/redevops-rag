@@ -1,0 +1,32 @@
+[project]
+name = "redevops-rag"
+version = "0.1.0"
+description = "Hybrid RAG (DuckDB vector + BM25 + RRF + recency/keyword priors + optional cross-encoder rerank) as an installable library + CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "redevops.io" }]
+keywords = ["rag", "retrieval", "hybrid-search", "bm25", "rrf", "reranker", "duckdb", "embeddings"]
+dependencies = [
+    "duckdb>=1.1",
+    "numpy>=1.24",
+    "sentence-transformers>=2.6",
+]
+
+[project.optional-dependencies]
+# Cross-encoder reranking (BAAI/bge-reranker-v2-m3). Pulls torch; install when you want
+# the final rerank stage.
+rerank = ["FlagEmbedding>=1.2"]
+# `ask` answer synthesis against any OpenAI-compatible endpoint (incl. a local MLX/llama.cpp
+# server or Anthropic via a gateway).
+llm = ["openai>=1.30"]
+
+[project.scripts]
+redevops-rag = "redevops_rag.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/redevops_rag"]
