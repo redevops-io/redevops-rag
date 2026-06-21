@@ -22,10 +22,12 @@ query
 
 ## Install
 
+Not on PyPI yet — install from git:
+
 ```bash
-pip install redevops-rag                 # core (DuckDB + sentence-transformers)
-pip install "redevops-rag[rerank]"       # + cross-encoder rerank (FlagEmbedding/torch)
-pip install "redevops-rag[llm]"          # + answer synthesis via any OpenAI-compatible API
+pip install "git+https://github.com/redevops-io/redevops-rag.git"                          # core
+pip install "redevops-rag[rerank] @ git+https://github.com/redevops-io/redevops-rag.git"   # + cross-encoder rerank
+pip install "redevops-rag[llm]    @ git+https://github.com/redevops-io/redevops-rag.git"   # + answer synthesis
 ```
 
 ## CLI
