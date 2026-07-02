@@ -16,11 +16,49 @@ _ANSWER_SYSTEM = (
 )
 
 
+def _is_pg_url(s: str) -> bool:
+    return s.startswith(("postgresql://", "postgresql+", "postgres://"))
+
+
 class RAG:
-    def __init__(self, db_path: str = "./redevops_rag.duckdb", embed_model: str | None = None,
-                 use_reranker: bool = False, rerank_model: str | None = None):
+    def __init__(
+        self,
+        db_path: str = "./redevops_rag.duckdb",
+        embed_model: str | None = None,
+        use_reranker: bool = False,
+        rerank_model: str | None = None,
+        *,
+        table: str | None = None,
+        schema: str | None = None,
+    ):
+        """Create a RAG facade over either a DuckDB file or a Postgres
+        (pgvector) database.
+
+        ``db_path`` routes on scheme: any URL starting with
+        ``postgresql://`` / ``postgres://`` selects the :class:`PgStore`
+        backend; anything else is treated as a DuckDB path. ``table`` and
+        ``schema`` are pgvector-only and let one Postgres host multiple
+        corpora side by side (e.g. ``nrag_chunks`` + ``other_chunks``).
+        """
+        # Fail fast on config errors BEFORE loading the embedder — the
+        # embedder pulls sentence-transformers weights on first call.
+        is_pg = _is_pg_url(db_path)
+        if not is_pg and (table is not None or schema is not None):
+            raise ValueError(
+                "`table`/`schema` are only supported with a Postgres db_path"
+            )
         self.embedder = Embedder(embed_model)
-        self.store = Store(self.embedder, db_path)
+        if is_pg:
+            # Lazy import so the base package installs cleanly without psycopg.
+            from .pg_store import PgStore
+            kw: dict = {}
+            if table is not None:
+                kw["table"] = table
+            if schema is not None:
+                kw["schema"] = schema
+            self.store = PgStore(self.embedder, db_path, **kw)
+        else:
+            self.store = Store(self.embedder, db_path)
         self.reranker = None
         if use_reranker:
             from .rerank import Reranker

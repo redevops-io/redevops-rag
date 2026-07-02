@@ -20,6 +20,10 @@ rerank = ["FlagEmbedding>=1.2"]
 # `ask` answer synthesis against any OpenAI-compatible endpoint (incl. a local MLX/llama.cpp
 # server or Anthropic via a gateway).
 llm = ["openai>=1.30"]
+# Postgres + pgvector storage backend (drop-in alternative to DuckDB when you need
+# multi-writer, network-attached storage). Selected by passing a `postgresql://` URL
+# as `db_path` to `RAG(...)`.
+pg = ["psycopg[binary]>=3.1", "pgvector>=0.3"]
 
 [project.scripts]
 redevops-rag = "redevops_rag.cli:main"
@@ -30,3 +34,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/redevops_rag"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

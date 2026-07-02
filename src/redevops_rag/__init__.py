@@ -8,8 +8,8 @@ from .embed import Embedder
 from .retrieve import hybrid_search, rrf_fuse
 from .store import Store
 
-__all__ = ["RAG", "Store", "Embedder", "hybrid_search", "rrf_fuse"]
-__version__ = "0.1.0"
+__all__ = ["RAG", "Store", "PgStore", "Embedder", "hybrid_search", "rrf_fuse"]
+__version__ = "0.2.0"
 
 
 def __getattr__(name):
@@ -17,4 +17,8 @@ def __getattr__(name):
     if name == "RAG":
         from .rag import RAG
         return RAG
+    if name == "PgStore":
+        # Lazy: psycopg is an optional [pg] extra.
+        from .pg_store import PgStore
+        return PgStore
     raise AttributeError(name)
