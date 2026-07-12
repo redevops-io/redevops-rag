@@ -89,20 +89,23 @@ def hybrid_search(
     keyword_boost_per_term: float = 0.05,
     keyword_boost_cap: float = 1.5,
     reranker: Optional["Reranker"] = None,  # noqa: F821
+    document_ids: list | None = None,
 ) -> list[dict[str, Any]]:
     """Vector + BM25 → RRF → recency/keyword boosts → optional cross-encoder rerank.
 
     ``pool`` candidates are fused/boosted; the top ``pool`` then go to the reranker (if
-    given) which returns the final ``limit``.
+    given) which returns the final ``limit``. ``document_ids`` (optional) scopes the
+    search to a document subset — used to build graduated-pollution candidate pools.
     """
     if not query or not query.strip():
         return []
     try:
-        vector_hits = store.semantic_search(query, top_k=pool, threshold=vector_threshold)
+        vector_hits = store.semantic_search(query, top_k=pool, threshold=vector_threshold,
+                                            document_ids=document_ids)
     except Exception:
         vector_hits = []
     try:
-        bm25_hits = store.bm25_search(query, limit=pool)
+        bm25_hits = store.bm25_search(query, limit=pool, document_ids=document_ids)
     except Exception:
         bm25_hits = []
     if not vector_hits and not bm25_hits:

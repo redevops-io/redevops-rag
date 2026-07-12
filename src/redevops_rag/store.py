@@ -67,30 +67,44 @@ class Store:
         except Exception:
             pass
 
-    def semantic_search(self, text: str, top_k: int = 50, threshold: float = 0.4) -> list[dict]:
+    def semantic_search(self, text: str, top_k: int = 50, threshold: float = 0.4,
+                        document_ids: list | None = None) -> list[dict]:
         q = self.embedder.encode([text])[0]
+        scope = ""
+        params: list = [list(q), float(threshold)]
+        if document_ids is not None:
+            scope = "AND document_id = ANY(?::VARCHAR[]) "
+            params.append(list(document_ids))
+        params.append(int(top_k))
         rows = self.con.execute(
             f"""SELECT id, document_id, filename, chunk_index, text, metadata, created_at, sim
                 FROM (
                     SELECT *, array_cosine_similarity(embedding, ?::FLOAT[{self.dim}]) AS sim
                     FROM chunks
                 )
-                WHERE sim >= ? ORDER BY sim DESC LIMIT ?""",
-            [list(q), float(threshold), int(top_k)],
+                WHERE sim >= ? {scope}ORDER BY sim DESC LIMIT ?""",
+            params,
         ).fetchall()
         return [self._row(r, "similarity", r[7], "vector") for r in rows]
 
-    def bm25_search(self, text: str, limit: int = 50) -> list[dict]:
+    def bm25_search(self, text: str, limit: int = 50,
+                    document_ids: list | None = None) -> list[dict]:
         if not self._fts or not text.strip():
             return []
+        scope = ""
+        params: list = [text]
+        if document_ids is not None:
+            scope = "AND document_id = ANY(?::VARCHAR[]) "
+            params.append(list(document_ids))
+        params.append(int(limit))
         try:
             rows = self.con.execute(
-                """SELECT id, document_id, filename, chunk_index, text, metadata, created_at, score
+                f"""SELECT id, document_id, filename, chunk_index, text, metadata, created_at, score
                    FROM (
                        SELECT *, fts_main_chunks.match_bm25(id, ?) AS score FROM chunks
                    )
-                   WHERE score IS NOT NULL ORDER BY score DESC LIMIT ?""",
-                [text, int(limit)],
+                   WHERE score IS NOT NULL {scope}ORDER BY score DESC LIMIT ?""",
+                params,
             ).fetchall()
         except Exception:
             return []
