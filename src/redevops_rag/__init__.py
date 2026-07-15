@@ -6,9 +6,10 @@ multi-tenant workspace/SaaS shell.
 """
 from .embed import Embedder
 from .retrieve import diver_search, hybrid_search, rrf_fuse
+from .temporal import ReasonIREmbedder, TemporalReasoningRetriever
 from .store import Store
 
-__all__ = ["RAG", "Store", "PgStore", "Embedder", "hybrid_search", "diver_search", "rrf_fuse"]
+__all__ = ["RAG", "Store", "PgStore", "Embedder", "hybrid_search", "diver_search", "rrf_fuse", "TemporalReasoningRetriever", "ReasonIREmbedder"]
 __version__ = "0.2.0"
 
 
