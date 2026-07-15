@@ -5,10 +5,10 @@ Extracted from redevops-io/rag-saas-platform's retrieval pipeline, decoupled fro
 multi-tenant workspace/SaaS shell.
 """
 from .embed import Embedder
-from .retrieve import hybrid_search, rrf_fuse
+from .retrieve import diver_search, hybrid_search, rrf_fuse
 from .store import Store
 
-__all__ = ["RAG", "Store", "PgStore", "Embedder", "hybrid_search", "rrf_fuse"]
+__all__ = ["RAG", "Store", "PgStore", "Embedder", "hybrid_search", "diver_search", "rrf_fuse"]
 __version__ = "0.2.0"
 
 
