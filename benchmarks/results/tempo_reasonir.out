@@ -1,0 +1,13 @@
+domain=workplace docs=64659 queries=36 | embedder=ReasonIR-8B(GPU)
+embedding corpus via ReasonIR (GPU)...
+indexed.
+  10/36
+  20/36
+  30/36
+
+=== TEMPO / workplace — ReasonIR-8B embeddings (36 q) ===
+config         NDCG@10   Recall@10     MRR
+sim_bm25         0.197       0.245   0.276
+hybrid           0.332       0.441   0.388
+diver            0.427       0.550   0.510
+DONE
