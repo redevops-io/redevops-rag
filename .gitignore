@@ -8,3 +8,8 @@ build/
 *.egg-info/
 .pytest_cache/
 example.duckdb
+
+# benchmark run logs/stores (ephemeral)
+benchmarks/results/*.err
+benchmarks/results/*.out
+*.duckdb
