@@ -1,25 +1,36 @@
-"""Temporal / reasoning-intensive retrieval plugin — DIVER + ReasonIR, merged.
+"""Temporal / reasoning-intensive retrieval — DIVER (the recommended default) plus two
+opt-in, non-default building blocks (the combined DIVER+ReasonIR retriever and the
+ReasonIR embedder).
 
-One plugin that owns both halves of reasoning-intensive temporal retrieval:
+The recommended temporal reasoning retriever is **DIVER** (:func:`redevops_rag.diver_search`)
+— LLM query expansion → hybrid retrieve (union over sub-queries) → LLM listwise rerank —
+run over a *cheap* embedder. It is embedder-agnostic and is the strongest, cheapest option
+we measured. Neither class below is a redevops-rag default; import them explicitly.
 
-  • the *embedder* — ReasonIR-8B (arXiv:2504.20595), a bidirectional 8B reasoning
-    retriever, served over an OpenAI-compatible ``/v1/embeddings`` endpoint (vLLM,
-    ``LlamaBidirectionalModel`` + mean pooling); and
-  • the *retrieval pipeline* — DIVER (arXiv:2508.07995): LLM query expansion → hybrid
-    retrieve (union over sub-queries) → LLM listwise rerank (:func:`diver_search`).
+Ablation (TEMPO/workplace, matched limit=10/pool=25, NDCG@10):
 
-Together they form the strongest single retriever we measured (TEMPO/workplace
-NDCG@10 0.197 BM25 → 0.33 hybrid → ~0.43 DIVER; ReasonIR beats bge on the dense/hybrid
-stage). Exposed as one arm so Context Runtime's bandit can *select* it per query
-against the cheaper ``hybrid_search`` configs — see
-``context_runtime.integrations.redevops_rag`` for the tuner that does the selecting.
+    sim/BM25 ............... 0.197
+    hybrid · bge .......... 0.297      hybrid · ReasonIR ... 0.325   (+ReasonIR helps hybrid)
+    DIVER · bge (solo) .... 0.448      DIVER · ReasonIR .... 0.337   (+ReasonIR HURTS DIVER)
+
+So: **DIVER over a cheap encoder (bge) is the default** — best and cheapest. ReasonIR lifts
+*plain hybrid* (+0.03) but *degrades* DIVER (−0.11), because DIVER feeds the embedder
+already-expanded sub-queries rather than the reasoning-heavy original ReasonIR is tuned for.
+
+:class:`TemporalReasoningRetriever` — DIVER over any store, exposed as a single Context
+Runtime bandit arm (see ``context_runtime.integrations.redevops_rag``). Pair it with a cheap
+embedder; do NOT pair it with ReasonIR (that's the losing combo above).
+
+:class:`ReasonIREmbedder` — ReasonIR-8B (arXiv:2504.20595) over a vLLM ``/v1/embeddings``
+endpoint. Opt-in embedder for the *hybrid* arm only, where its reasoning-tuned vectors help;
+not a default, and not for the DIVER path.
 
 Usage::
 
-    emb   = ReasonIREmbedder("http://host:8012/v1/embeddings")
-    store = Store(emb, "corpus.duckdb")           # docs + queries embed via ReasonIR
-    plug  = TemporalReasoningRetriever(reason_llm)  # reason_llm(system, user) -> str
-    hits  = plug.search(store, query, limit=8)
+    from redevops_rag import Embedder, Store, TemporalReasoningRetriever
+    store = Store(Embedder(), "corpus.duckdb")        # cheap bge — the recommended pairing
+    plug  = TemporalReasoningRetriever(reason_llm)    # reason_llm(system, user) -> str
+    hits  = plug.search(store, query, limit=8)        # DIVER over bge = the default temporal retriever
 """
 from __future__ import annotations
 
@@ -31,7 +42,9 @@ from .retrieve import diver_search, hybrid_search
 
 
 class ReasonIREmbedder:
-    """ReasonIR-8B embeddings over an OpenAI-compatible endpoint (vLLM on GPU).
+    """ReasonIR-8B embeddings over an OpenAI-compatible endpoint (vLLM on GPU). **Opt-in,
+    non-default** — best for the *plain hybrid* arm (helps ~+0.03 NDCG@10 on TEMPO); do NOT
+    use it under DIVER, where it degrades results (~−0.11) vs a cheap encoder.
 
     Drop-in for :class:`redevops_rag.embed.Embedder` — exposes ``encode`` + ``dim`` so a
     :class:`Store` built with it embeds *both* documents and queries via ReasonIR. Serve
@@ -60,13 +73,16 @@ class ReasonIREmbedder:
 
 
 class TemporalReasoningRetriever:
-    """The merged DIVER + ReasonIR temporal retrieval plugin.
+    """DIVER temporal reasoning retriever, exposed as one Context Runtime bandit arm.
 
     ``reason_llm(system, user) -> str`` is the reasoning model used for DIVER's query
-    expansion and listwise rerank. ``search`` runs the full DIVER pipeline over a store
-    that should be ReasonIR-embedded (:class:`ReasonIREmbedder`). With ``reason_llm``
-    None it degrades to plain :func:`hybrid_search`, so it is a safe bandit arm even on
-    cold start / no-LLM budget.
+    expansion and listwise rerank. ``search`` runs the full DIVER pipeline over the given
+    store. With ``reason_llm`` None it degrades to plain :func:`hybrid_search`, so it is a
+    safe bandit arm on cold start / no-LLM budget.
+
+    Recommended pairing: a **cheap embedder** (:class:`redevops_rag.embed.Embedder`, bge) —
+    that's DIVER-solo, the best/cheapest config in the ablation. Do NOT build the store with
+    :class:`ReasonIREmbedder`: the combined DIVER+ReasonIR is the losing arm (0.337 vs 0.448).
     """
 
     name = "temporal_reasoning"
