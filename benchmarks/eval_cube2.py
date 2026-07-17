@@ -36,12 +36,50 @@ N = int(os.environ.get("N", "12"))
 K = int(os.environ.get("K", "8"))          # raised from 6 (d): more room for both multi-hop bridges
 BUDGET = int(os.environ.get("BUDGET", "3000"))
 NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}}
+# ---- Phase-0 generation-strategy ablation (the answer-plane axis) --------------------------------
+# STRATEGIES sweeps the generation strategy per cell, isolating GENERATION from retrieval (run with
+# CONDS=oracle to hold retrieval at gold). `direct` reproduces the prior terse/no-think baseline
+# EXACTLY; reason/decompose/mapreduce turn thinking on, widen the budget, and recalibrate abstention.
+#   direct     — terse extractive, no-think, 96 tok            (lookup)
+#   reason     — think + CoT + short final answer              (synthesis / single-hop reasoning)
+#   decompose  — list intermediate facts → answer → compose    (multi_hop)
+#   mapreduce  — extract (date,entity,value) per source → agg  (temporal aggregation / counting)
+# The resulting acc per (dataset, strategy, model) at oracle is the warm-start prior for the CR
+# generation bandit (Phase 1).  e.g.:
+#   CONDS=oracle STRATEGIES=direct,reason,decompose,mapreduce DATASETS=musique,longmemeval \
+#     MODELS=qwen METHODS=hybrid N=12 <venv>/bin/python benchmarks/eval_cube2.py
+STRATEGIES = os.environ.get("STRATEGIES", "direct").split(",")
+GEN_BUDGET = int(os.environ.get("GEN_BUDGET", "768"))       # token budget for reasoning strategies
+# Recalibrated abstention (Step 4): don't bail when the pieces are present — the cure for over-abstention.
+_ABSTAIN = ("If the pieces needed to answer are present in the context, reason across them and answer; "
+            "reply exactly NOT FOUND only if the context truly lacks the answer.")
 os.makedirs(RES, exist_ok=True)
+
+
+def _extra(model, think):
+    """Thinking-capable models were registered with the NOTHINK sentinel; flip enable_thinking per
+    strategy. Models without a thinking switch pass their configured extra through unchanged."""
+    if MODEL_CFG[model].get("extra") == NOTHINK:
+        return {"chat_template_kwargs": {"enable_thinking": bool(think)}}
+    return MODEL_CFG[model].get("extra") or {}
+
+
+def _final(out):
+    """Pull the final answer from a reasoning response: strip <think> blocks, then take the 'Answer:'
+    line if present (the reasoning strategies end with one), else the last non-empty line."""
+    import re
+    out = re.sub(r"<think>.*?</think>", "", out or "", flags=re.S).strip()
+    for line in reversed(out.splitlines()):
+        s = line.strip()
+        if s.lower().startswith("answer:"):
+            return s.split(":", 1)[1].strip()
+    return out.splitlines()[-1].strip() if out.strip() else out
 
 # ---- 7-model registry (4 GPU NVFP4 + 3 CPU GGUF). url=None => not currently served; the
 # serve-and-swap driver fills the port it brings each model up on. tier drives default N. ----
 MODEL_CFG = {
     "qwen":       {"url": "http://192.168.40.105:30807/v1", "model": "Qwen3.6-35B-A3B",   "extra": NOTHINK, "tier": "gpu", "rank": 2},
+    "qwen35":     {"url": os.environ.get("QWEN35_URL"),     "model": "Qwen3.5-122B",      "extra": {},       "tier": "cpu", "rank": 3},
     "mistral":    {"url": os.environ.get("MISTRAL_URL"),    "model": "mistral-small-24b", "extra": {},       "tier": "gpu", "rank": 1},
     "gemma":      {"url": os.environ.get("GEMMA_URL"),      "model": "gemma4-26b-a4b",    "extra": {},       "tier": "gpu", "rank": 1},
     "nemotron":   {"url": os.environ.get("NEMOTRON_URL"),   "model": "nemotron3-nano-30b","extra": NOTHINK,  "tier": "gpu", "rank": 2},
@@ -61,15 +99,38 @@ def reason_llm(system, user):
         extra_body=NOTHINK, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
     return (r.choices[0].message.content or "").strip()
 
-def answer(model, ctx, q):
+def _gen(model, sys_p, user, *, think, budget):
     c = MODEL_CFG[model]
-    sys_p = ("Answer using ONLY the provided context, in as few words as possible. If the answer is "
-             "not in the context, reply exactly: NOT FOUND.") if ctx else \
-            "Answer in as few words as possible. If you do not know, reply exactly: NOT FOUND."
-    user = (f"Context:\n{ctx}\n\nQuestion: {q}\nAnswer:") if ctx else f"Question: {q}\nAnswer:"
-    r = clients[model].chat.completions.create(model=c["model"], temperature=0, max_tokens=96, extra_body=c["extra"],
-        messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": user}])
+    r = clients[model].chat.completions.create(model=c["model"], temperature=0, max_tokens=budget,
+        extra_body=_extra(model, think), messages=[{"role": "system", "content": sys_p},
+                                                    {"role": "user", "content": user}])
     return (r.choices[0].message.content or "").strip()
+
+def answer(model, ctx, q, strategy="direct"):
+    # closed-book (no context): unchanged, terse.
+    if not ctx:
+        return _gen(model, "Answer in as few words as possible. If you do not know, reply exactly: "
+                    "NOT FOUND.", f"Question: {q}\nAnswer:", think=False, budget=96)
+    # `direct` reproduces the prior terse/no-think baseline EXACTLY (verbatim prompt + 96 tok).
+    if strategy in ("direct", "terse"):
+        return _gen(model, "Answer using ONLY the provided context, in as few words as possible. If the "
+                    "answer is not in the context, reply exactly: NOT FOUND.",
+                    f"Context:\n{ctx}\n\nQuestion: {q}\nAnswer:", think=False, budget=96)
+    # reasoning strategies: thinking on, wider budget, recalibrated abstention, 'Answer:' final line.
+    if strategy == "reason":
+        sys_p = ("Answer the question using ONLY the provided context. Think step by step, then give a "
+                 "short final answer on a line beginning 'Answer:'. " + _ABSTAIN)
+    elif strategy == "decompose":
+        sys_p = ("Answer the multi-hop question using ONLY the provided context. First list the "
+                 "intermediate facts needed and answer each from the context, then compose the final "
+                 "answer on a line beginning 'Answer:'. " + _ABSTAIN)
+    elif strategy == "mapreduce":
+        sys_p = ("You aggregate across sources. From the context, extract every relevant fact as a "
+                 "bullet '- (when, who/what, value)', then compute the answer over those facts and give "
+                 "it on a line beginning 'Answer:'. " + _ABSTAIN)
+    else:
+        raise ValueError(f"unknown strategy {strategy!r}")
+    return _final(_gen(model, sys_p, f"Context:\n{ctx}\n\nQuestion: {q}", think=True, budget=GEN_BUDGET))
 
 def judge(question, golds, cand):
     if not cand or cand.strip().upper() == "NOT FOUND": return False
@@ -174,20 +235,21 @@ for name in DATASETS:
             for it in items: retr[it["qid"]] = ctx_of(retrieve_texts(method, it), BUDGET)
         for model in MODELS:
             if model not in clients: continue
-            res = {c: [] for c in CONDS}
-            for it in items:
-                golds = [it["answer"], *it.get("aliases", [])]
-                for cond in CONDS:
-                    if cond == "closed":   ctx = ""
-                    elif cond == "oracle": ctx = ctx_of(goldtext[it["qid"]], BUDGET)
-                    else:  # retrieved
-                        if method == "cr-auto":
-                            m, texts = cr_route(it, model); ctx = ctx_of(texts, BUDGET)
-                            res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"]))); continue
-                        ctx = retr[it["qid"]]
-                    res[cond].append(judge(it["question"], golds, answer(model, ctx, it["question"])))
-            cell = {"dataset": name, "method": method, "model": model, "n": len(items),
-                    **{f"acc_{c}": round(st.mean(res[c]), 3) if res[c] else None for c in CONDS}}
-            json.dump(cell, open(f"{RES}/{name}__{method}__{model}.json", "w"))
-            print(f"  {name:11} {method:8} {model:9} " + " ".join(f"{c}={cell.get('acc_'+c)}" for c in CONDS), flush=True)
+            for strat in STRATEGIES:            # generation-strategy axis (Phase-0 answer-plane ablation)
+                res = {c: [] for c in CONDS}
+                for it in items:
+                    golds = [it["answer"], *it.get("aliases", [])]
+                    for cond in CONDS:
+                        if cond == "closed":   ctx = ""
+                        elif cond == "oracle": ctx = ctx_of(goldtext[it["qid"]], BUDGET)
+                        else:  # retrieved
+                            if method == "cr-auto":
+                                m, texts = cr_route(it, model); ctx = ctx_of(texts, BUDGET)
+                                res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], strat))); continue
+                            ctx = retr[it["qid"]]
+                        res[cond].append(judge(it["question"], golds, answer(model, ctx, it["question"], strat)))
+                cell = {"dataset": name, "method": method, "model": model, "strategy": strat, "n": len(items),
+                        **{f"acc_{c}": round(st.mean(res[c]), 3) if res[c] else None for c in CONDS}}
+                json.dump(cell, open(f"{RES}/{name}__{method}__{model}__{strat}.json", "w"))
+                print(f"  {name:11} {method:8} {model:9} {strat:9} " + " ".join(f"{c}={cell.get('acc_'+c)}" for c in CONDS), flush=True)
 print("CUBE2_DONE", flush=True)
