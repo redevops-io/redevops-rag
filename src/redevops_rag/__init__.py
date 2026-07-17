@@ -4,12 +4,12 @@ cross-encoder rerank) as an installable library + CLI.
 Extracted from redevops-io/rag-saas-platform's retrieval pipeline, decoupled from its
 multi-tenant workspace/SaaS shell.
 """
-from .embed import Embedder
+from .embed import Embedder, NemotronEmbedder, make_embedder
 from .retrieve import diver_search, hybrid_search, rrf_fuse
 from .temporal import ReasonIREmbedder, TemporalReasoningRetriever
 from .store import Store
 
-__all__ = ["RAG", "Store", "PgStore", "Embedder", "hybrid_search", "diver_search", "rrf_fuse", "TemporalReasoningRetriever", "ReasonIREmbedder"]
+__all__ = ["RAG", "Store", "PgStore", "Embedder", "NemotronEmbedder", "make_embedder", "hybrid_search", "diver_search", "rrf_fuse", "TemporalReasoningRetriever", "ReasonIREmbedder"]
 __version__ = "0.2.0"
 
 

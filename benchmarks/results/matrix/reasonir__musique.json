@@ -1,0 +1,1 @@
+{"method": "reasonir", "dataset": "musique", "regime": "multi-hop", "n": 1, "recall": 1.0, "ndcg": 1.0}
