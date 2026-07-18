@@ -95,7 +95,14 @@ def retrieve_ctx(method, item):
         rep = router.classify(item["question"]) or "document"
         s = store_for(item, _bge)
         if rep == "graph":    hits = diver_search(s, item["question"], reason_llm, limit=K, pool=25)
-        elif rep == "temporal": hits = hybrid_search(s, item["question"], limit=K, pool=25, recency_half_life_days=1.0)
+        elif rep == "temporal":
+            # temporal → DIVER (the temporal_reasoning arm), now IN the routed set. The old
+            # recency=1-day hybrid helped memory-temporal (longmemeval) but tanked temporal-REASONING
+            # (tempo 0.84→0.68) by burying older-but-relevant evidence; DIVER's expand+rerank finds it
+            # (tempo 0.91) and is strong on longmemeval too (0.92). Keep a MILD recency as a secondary
+            # prior for the memory case — env-tunable (CR_TEMPORAL_RECENCY_HL) for the sweep; 0 disables.
+            hl = float(os.environ.get("CR_TEMPORAL_RECENCY_HL", "30"))
+            hits = diver_search(s, item["question"], reason_llm, limit=K, pool=25, recency_half_life_days=hl)
         else:                 hits = hybrid_search(s, item["question"], limit=K, pool=25)
         s.close()
     else:  # bm25 (baseline) or hybrid

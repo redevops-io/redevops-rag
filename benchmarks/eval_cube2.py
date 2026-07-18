@@ -244,9 +244,12 @@ def cr_route(item, model):
     model-bound (temporal aggregation) -> escalate to the strongest served model. Also returns the
     regime-coupled reasoning strategy (B); the caller applies it only when CR_COUPLE is on."""
     rep = router.classify(item["question"]) or "document"
-    if rep == "temporal":                      # aggregation/counting = MODEL-bound
+    if rep == "temporal":                      # temporal-reasoning = RETRIEVAL- AND MODEL-sensitive
+        # DIVER is now in the temporal routed set: on TEMPO it scores 0.91 vs hybrid 0.84 (and vs the
+        # graph engines' 0.24-0.28), so temporal retrieves with DIVER, not plain hybrid — the fix for
+        # CR-auto's TEMPO gap. Still escalate the model (temporal aggregation is also model-bound).
         use_model = STRONGEST if (STRONGEST in clients and MODEL_CFG[STRONGEST]["rank"] > MODEL_CFG[model]["rank"]) else model
-        texts = retrieve_texts("hybrid", item)
+        texts = retrieve_texts("diver", item)
     elif rep == "graph":                        # multi-hop = RETRIEVAL-bound
         use_model, texts = model, retrieve_texts("diver", item)
     else:
