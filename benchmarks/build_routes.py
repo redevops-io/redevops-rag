@@ -38,6 +38,13 @@ OUT = os.environ.get("OUT", "routes.json")
 SELECT = os.environ.get("SELECT_COND", "acc_retrieved")   # route on the SERVED metric (Run-1 lesson)
 ROBUST = os.environ.get("ROBUST", "").lower() in ("1", "true", "yes", "on")  # score min(oracle,retrieved)
 FIXED_METHODS = {"bm25", "hybrid", "reasonir", "diver", "graphiti", "hipporag"}
+# Route on DETERMINISTIC strategies only. The v6 re-run's third strike: reason/decompose/mapreduce not
+# only don't beat direct at oracle (refuted), they're NON-REPRODUCIBLE — a re-run of the *same* route
+# flips 2-3 of 12 (long, variance-prone outputs: musique diver/reason 0.667→0.417, longmemeval
+# diver/decompose 0.167→0.00), so routing to them is unstable. Every `direct` route reproduced exactly.
+# Drop them; keep direct + the deterministic `aggregate` (code-reduce). DROP_STRATEGIES overrides.
+DROP_STRATEGIES = set(s for s in os.environ.get(
+    "DROP_STRATEGIES", "reason,decompose,mapreduce").split(",") if s)
 
 # dataset → the router representation it classifies as (aggregation key for by_rep).
 DATASET_REP = {"popqa": "document", "nutrition": "document", "musique": "graph",
@@ -71,9 +78,10 @@ def best_cell(cells):
 
 
 def main():
-    rows = [r for r in csv.DictReader(open(CUBE_CSV)) if r["method"] in FIXED_METHODS]
+    rows = [r for r in csv.DictReader(open(CUBE_CSV))
+            if r["method"] in FIXED_METHODS and r["strategy"] not in DROP_STRATEGIES]
     if not rows:
-        raise SystemExit(f"no fixed-method rows in {CUBE_CSV!r}")
+        raise SystemExit(f"no fixed-method rows in {CUBE_CSV!r} after dropping {DROP_STRATEGIES}")
 
     by_dataset = {}
     per_dataset = {}
