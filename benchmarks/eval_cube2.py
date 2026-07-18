@@ -53,6 +53,23 @@ GEN_BUDGET = int(os.environ.get("GEN_BUDGET", "768"))       # token budget for r
 # Recalibrated abstention (Step 4): don't bail when the pieces are present — the cure for over-abstention.
 _ABSTAIN = ("If the pieces needed to answer are present in the context, reason across them and answer; "
             "reply exactly NOT FOUND only if the context truly lacks the answer.")
+
+# ---- (A) y-axis: best EMBEDDER per dataset (opt-in EMBED_ROUTING=1) --------------------------------
+# "model coupled with best embedder for the dataset": route the encoder on the corpus (redevops-rag
+# encoder_for) — nutrition is Russian/domain → Nemotron-Embed; the English sets → cheap bge. A Nemotron
+# store auto-applies the asymmetric query instruction (semantic_search query_mode + DIVER instruct/plain),
+# so no call-site change is needed here. Default OFF → hardcoded bge, byte-identical to prior cube2 runs.
+# Needs the Nemotron endpoint served (REDEVOPS_RAG_NEMOTRON_URL). The 'reasonir' method keeps its own
+# ReasonIR embedder regardless (a fixed English arm, a legitimate cell to measure).
+EMBED_ROUTING = os.environ.get("EMBED_ROUTING", "").lower() in ("1", "true", "yes", "on")
+DATASET_CORPUS = {"nutrition": ("ru", "nutrition")}   # dataset -> (lang, domain); default ('en','')
+
+# ---- (B) z-axis: couple CR-auto retrieval mode with proper INFERENCE (opt-in CR_COUPLE=1) ----------
+# cr-auto already picks retriever+model per regime; coupling also picks the reasoning strategy per
+# regime (temporal→mapreduce aggregation, multi-hop→decompose, lookup/document→direct). When on, the
+# cr-auto cell ignores the swept STRATEGIES and labels its strategy 'auto'. Default OFF → prior cr-auto.
+CR_COUPLE = os.environ.get("CR_COUPLE", "").lower() in ("1", "true", "yes", "on")
+REGIME_STRATEGY = {"temporal": "mapreduce", "graph": "decompose", "document": "direct", "low_graph": "direct"}
 os.makedirs(RES, exist_ok=True)
 
 
@@ -153,6 +170,22 @@ def ctx_of(texts, budget):
     return "\n\n".join(out)
 
 _bge = Embedder(); _ri = None
+_emb_cache = {"bge": _bge}
+ACTIVE_EMB = _bge   # the dataset's routed default embedder (set per dataset in the main loop)
+
+def dataset_embedder(name):
+    """(A) The best embedder for a dataset's corpus. EMBED_ROUTING off → always bge (prior behavior)."""
+    if not EMBED_ROUTING:
+        return _bge
+    from redevops_rag.embed import encoder_for, make_embedder
+    lang, domain = DATASET_CORPUS.get(name, ("en", ""))
+    backend = encoder_for(lang, domain)
+    if backend == "colpali":     # doc-visual arm is out of scope for this text cube — fall back to bge
+        backend = "bge"
+    if backend not in _emb_cache:
+        _emb_cache[backend] = make_embedder(backend)
+    return _emb_cache[backend]
+
 def _store(item, embedder):
     dbp = f"/tmp/c2_{id(embedder)%9999}_{item['qid']}.duckdb"
     if os.path.exists(dbp): os.remove(dbp)
@@ -178,7 +211,7 @@ def retrieve_texts(method, item):
         return [h["text"] for h in hits]
     if method == "graphiti":
         return graphiti_texts(item)
-    s = _store(item, _bge)
+    s = _store(item, ACTIVE_EMB)
     if method == "diver":     hits = diver_search(s, item["question"], reason_llm, limit=K, pool=25)
     elif method == "bm25":    hits = s.bm25_search(item["question"], limit=K)
     else:                     hits = multihop_union(s, item["question"]) if item["regime"] == "graph" else hybrid_search(s, item["question"], limit=K, pool=25)
@@ -208,7 +241,8 @@ def graphiti_texts(item):
 
 def cr_route(item, model):
     """(c) bottleneck-aware: retrieval-bound regimes -> best retriever + given model;
-    model-bound (temporal aggregation) -> escalate to the strongest served model."""
+    model-bound (temporal aggregation) -> escalate to the strongest served model. Also returns the
+    regime-coupled reasoning strategy (B); the caller applies it only when CR_COUPLE is on."""
     rep = router.classify(item["question"]) or "document"
     if rep == "temporal":                      # aggregation/counting = MODEL-bound
         use_model = STRONGEST if (STRONGEST in clients and MODEL_CFG[STRONGEST]["rank"] > MODEL_CFG[model]["rank"]) else model
@@ -217,7 +251,7 @@ def cr_route(item, model):
         use_model, texts = model, retrieve_texts("diver", item)
     else:
         use_model, texts = model, retrieve_texts("hybrid", item)
-    return use_model, texts
+    return use_model, texts, REGIME_STRATEGY.get(rep, "direct")
 
 def load(name):
     rows = [json.loads(l) for l in open(f"{DATADIR}/{name}.jsonl")]
@@ -227,6 +261,9 @@ def load(name):
 print(f"models={MODELS} methods={METHODS} conds={CONDS} datasets={DATASETS} N={N} K={K}", flush=True)
 for name in DATASETS:
     items = load(name)
+    ACTIVE_EMB = dataset_embedder(name)   # (A) route the dataset's default embedder (bge unless EMBED_ROUTING)
+    if EMBED_ROUTING:
+        print(f"  [embed-routing] {name} -> {getattr(ACTIVE_EMB, 'backend', 'bge')} (dim={ACTIVE_EMB.dim})", flush=True)
     goldtext = {it["qid"]: [d["text"] for d in it["docs"] if d["chunk_id"] in set(it["gold"])] for it in items}
     for method in METHODS:
         # precompute retrieved context per item (reused across models & conds)
@@ -244,8 +281,9 @@ for name in DATASETS:
                         elif cond == "oracle": ctx = ctx_of(goldtext[it["qid"]], BUDGET)
                         else:  # retrieved
                             if method == "cr-auto":
-                                m, texts = cr_route(it, model); ctx = ctx_of(texts, BUDGET)
-                                res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], strat))); continue
+                                m, texts, cr_strat = cr_route(it, model); ctx = ctx_of(texts, BUDGET)
+                                use_strat = cr_strat if CR_COUPLE else strat   # (B) couple inference to regime
+                                res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], use_strat))); continue
                             ctx = retr[it["qid"]]
                         res[cond].append(judge(it["question"], golds, answer(model, ctx, it["question"], strat)))
                 cell = {"dataset": name, "method": method, "model": model, "strategy": strat, "n": len(items),

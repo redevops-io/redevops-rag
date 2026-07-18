@@ -79,11 +79,17 @@ class PgStore:
             # will CREATE EXTENSION and we retry.
             pass
         self._ensure_schema()
+        self._stamp_encoder()
 
     @property
     def _qtable(self) -> str:
         # Identifiers are validated in __init__ — safe to interpolate.
         return f'"{self.schema}"."{self.table}"' if self.schema else f'"{self.table}"'
+
+    @property
+    def _qmeta(self) -> str:
+        name = f"{self.table}_meta"
+        return f'"{self.schema}"."{name}"' if self.schema else f'"{name}"'
 
     def _ensure_schema(self) -> None:
         with self.con.cursor() as cur:
@@ -110,12 +116,53 @@ class PgStore:
                 f'CREATE INDEX IF NOT EXISTS "{self.table}_tsv_idx" '
                 f'ON {self._qtable} USING GIN (text_tsv)'
             )
+            # per-corpus index metadata — records which ENCODER built this table so query-time
+            # reconstructs the same one (a mismatched query encoder silently returns garbage).
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._qmeta} "
+                f"(key TEXT PRIMARY KEY, value JSONB)"
+            )
         self.con.commit()
         # Re-register in case the extension was just installed on this session.
         try:
             register_vector(self.con)
         except Exception:
             pass
+
+    def set_meta(self, **kv: Any) -> None:
+        """Persist per-corpus metadata (e.g. ``backend='nemotron', model=..., lang='ru'``). Call at
+        build time so :func:`open_pg_store` reopens the corpus with the matching encoder."""
+        rows = [(k, json.dumps(v)) for k, v in kv.items()]
+        if not rows:
+            return
+        with self.con.cursor() as cur:
+            cur.executemany(
+                f"INSERT INTO {self._qmeta} (key, value) VALUES (%s, %s::jsonb) "
+                f"ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                rows,
+            )
+        self.con.commit()
+
+    def get_meta(self, key: str | None = None, default: Any = None) -> Any:
+        """Read one meta value (``key`` given) or the whole dict (``key`` None)."""
+        try:
+            with self.con.cursor() as cur:
+                cur.execute(f"SELECT key, value FROM {self._qmeta}")
+                rows = cur.fetchall()
+        except Exception:
+            return default if key is not None else {}
+        meta = {k: (json.loads(v) if isinstance(v, str) else v) for k, v in rows}
+        return meta.get(key, default) if key is not None else meta
+
+    def _stamp_encoder(self) -> None:
+        """Record the building encoder's identity once (never clobber), so :func:`open_pg_store`
+        reopens this corpus with the SAME encoder. Mirrors the DuckDB Store."""
+        backend = getattr(self.embedder, "backend", None)
+        if backend and self.get_meta("backend") is None:
+            self.set_meta(backend=backend,
+                          model=getattr(self.embedder, "model_name", None)
+                          or getattr(self.embedder, "model", None),
+                          dim=self.dim)
 
     def add_chunks(
         self, chunks: list[dict[str, Any]], reindex: bool = False,
@@ -184,31 +231,55 @@ class PgStore:
             cur.execute(f"ANALYZE {self._qtable}")
         self.con.commit()
 
+    def _encode_query(self, text: str, query_mode: str) -> list:
+        """Encode a query, honouring an asymmetric encoder's ``encode_queries`` (reasoning/
+        instruction-tuned encoders like Nemotron/ReasonIR). ``instruct``/``auto`` use it when
+        present; ``plain`` always uses ``encode``. Symmetric encoders (bge) collapse to ``encode``.
+        Mirrors the DuckDB Store so DIVER's instruct-vs-plain query construction works over pg too."""
+        instruct = query_mode == "instruct" or query_mode == "auto"
+        eq = getattr(self.embedder, "encode_queries", None)
+        vec = eq([text])[0] if (instruct and callable(eq)) else self.embedder.encode([text])[0]
+        return list(vec)
+
     def semantic_search(
         self, text: str, top_k: int = 50, threshold: float = 0.4,
+        document_ids: list | None = None, query_mode: str = "auto",
     ) -> list[dict]:
-        q = list(self.embedder.encode([text])[0])
+        q = self._encode_query(text, query_mode)
+        scope = ""
+        params: list = [q, q, float(threshold)]
+        if document_ids is not None:
+            scope = "AND document_id = ANY(%s) "
+            params.append(list(document_ids))
+        params += [q, int(top_k)]
         with self.con.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT id, document_id, filename, chunk_index, text, metadata,
                        created_at, (1 - (embedding <=> %s::vector)) AS sim
                 FROM {self._qtable}
-                WHERE (1 - (embedding <=> %s::vector)) >= %s
+                WHERE (1 - (embedding <=> %s::vector)) >= %s {scope}
                 ORDER BY embedding <=> %s::vector ASC
                 LIMIT %s
                 """,
-                [q, q, float(threshold), q, int(top_k)],
+                params,
             )
             rows = cur.fetchall()
         return [self._row(r, "similarity", r[7], "vector") for r in rows]
 
-    def bm25_search(self, text: str, limit: int = 50) -> list[dict]:
+    def bm25_search(self, text: str, limit: int = 50,
+                    document_ids: list | None = None) -> list[dict]:
         """Sparse-leg search using tsvector + ts_rank_cd. Keeps the name
         ``bm25_search`` and the ``bm25_score`` result key so hybrid RRF
         fusion / boosts run unchanged."""
         if not text.strip():
             return []
+        scope = ""
+        params: list = [text, text]
+        if document_ids is not None:
+            scope = "AND document_id = ANY(%s) "
+            params.append(list(document_ids))
+        params.append(int(limit))
         try:
             with self.con.cursor() as cur:
                 cur.execute(
@@ -218,11 +289,11 @@ class PgStore:
                            ts_rank_cd(text_tsv,
                                       plainto_tsquery('english', %s)) AS score
                     FROM {self._qtable}
-                    WHERE text_tsv @@ plainto_tsquery('english', %s)
+                    WHERE text_tsv @@ plainto_tsquery('english', %s) {scope}
                     ORDER BY score DESC
                     LIMIT %s
                     """,
-                    [text, text, int(limit)],
+                    params,
                 )
                 rows = cur.fetchall()
         except Exception:
@@ -256,3 +327,32 @@ class PgStore:
 
     def close(self) -> None:
         self.con.close()
+
+
+def open_pg_store(conn_url: str, table: str = "redevops_rag_chunks",
+                  schema: str | None = None, embedder=None, **embed_kw) -> "PgStore":
+    """Open an existing pgvector corpus with the encoder it was BUILT with (read from
+    ``{table}_meta``). Mirrors :func:`redevops_rag.store.open_store`: a corpus embedded with
+    Nemotron must be queried with Nemotron (matching space + dim). Pass ``embedder`` to override;
+    a legacy table with no stamp falls back to the default (bge)."""
+    if embedder is not None:
+        return PgStore(embedder, conn_url, table=table, schema=schema)
+    backend = model = None
+    try:  # peek at the stamp with a throwaway connection before building the (heavy) encoder
+        con = psycopg.connect(conn_url, autocommit=True)
+        try:
+            name = f"{table}_meta"
+            qmeta = f'"{schema}"."{name}"' if schema else f'"{name}"'
+            with con.cursor() as cur:
+                cur.execute(f"SELECT key, value FROM {qmeta}")
+                meta = {k: (json.loads(v) if isinstance(v, str) else v) for k, v in cur.fetchall()}
+            backend, model = meta.get("backend"), meta.get("model")
+        finally:
+            con.close()
+    except Exception:
+        pass
+    from .embed import make_embedder
+    kw = dict(embed_kw)
+    if model and backend in ("nemotron", "reasonir", "colpali", "colqwen"):
+        kw.setdefault("model", model)
+    return PgStore(make_embedder(backend, **kw), conn_url, table=table, schema=schema)

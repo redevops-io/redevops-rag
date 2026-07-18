@@ -90,18 +90,21 @@ def hybrid_search(
     keyword_boost_cap: float = 1.5,
     reranker: Optional["Reranker"] = None,  # noqa: F821
     document_ids: list | None = None,
+    query_mode: str = "auto",
 ) -> list[dict[str, Any]]:
     """Vector + BM25 → RRF → recency/keyword boosts → optional cross-encoder rerank.
 
     ``pool`` candidates are fused/boosted; the top ``pool`` then go to the reranker (if
     given) which returns the final ``limit``. ``document_ids`` (optional) scopes the
     search to a document subset — used to build graduated-pollution candidate pools.
+    ``query_mode`` controls the vector leg's query encoding for asymmetric encoders
+    (``instruct``/``plain``/``auto``) — inert for a symmetric encoder like bge.
     """
     if not query or not query.strip():
         return []
     try:
         vector_hits = store.semantic_search(query, top_k=pool, threshold=vector_threshold,
-                                            document_ids=document_ids)
+                                            document_ids=document_ids, query_mode=query_mode)
     except Exception:
         vector_hits = []
     try:
@@ -179,6 +182,13 @@ def diver_search(
     and listwise reranking. Pipeline: expand → hybrid retrieve each sub-query → dedup union
     → (optional cross-encoder) → LLM listwise rerank → top ``limit``. With ``reason_llm``
     None it degrades to plain :func:`hybrid_search`, so it is a safe drop-in replacement.
+
+    Encoder-aware query construction: the reasoning-heavy ORIGINAL query is embedded with the
+    encoder's instruction side (``query_mode='instruct'``), while the expanded sub-query
+    fragments go in ``plain`` — the instruction is tuned for the full reasoning query and *hurts*
+    the fragments, which is why DIVER over a reasoning encoder (ReasonIR/Nemotron) regressed vs
+    bge. On a symmetric encoder (bge) both modes are plain ``encode``, so DIVER-over-bge — the
+    recommended/cheapest config — stays byte-identical.
     """
     if not query or not query.strip():
         return []
@@ -186,9 +196,10 @@ def diver_search(
         return hybrid_search(store, query, limit=limit, pool=pool, document_ids=document_ids,
                              recency_half_life_days=recency_half_life_days, reranker=reranker)
     cand: dict[Any, dict] = {}
-    for q in [query, *_expand_query(reason_llm, query, n_subqueries)]:
+    expanded = [(query, "instruct")] + [(s, "plain") for s in _expand_query(reason_llm, query, n_subqueries)]
+    for q, mode in expanded:
         for h in hybrid_search(store, q, limit=pool, pool=pool, document_ids=document_ids,
-                               recency_half_life_days=recency_half_life_days):
+                               recency_half_life_days=recency_half_life_days, query_mode=mode):
             cand.setdefault(_ID(h), h)
     candidates = list(cand.values())
     if reranker is not None and candidates:

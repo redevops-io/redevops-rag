@@ -22,6 +22,9 @@ DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"  # 384-d, strong for retrieval, small e
 
 
 class Embedder:
+    #: backend tag persisted in the index so query-time reconstructs the SAME encoder (see open_store).
+    backend = "bge"
+
     def __init__(self, model_name: str | None = None, device: str | None = None):
         from sentence_transformers import SentenceTransformer  # lazy: heavy import
 
@@ -54,6 +57,8 @@ class NemotronEmbedder:
     ``encode`` is symmetric (used for both sides, like :class:`Embedder`); pass a query through
     :meth:`encode_queries` when you want the instruction prefix applied.
     """
+
+    backend = "nemotron"
 
     #: NV/Nemotron retrieval instruction; prepended to queries only (documents are embedded raw).
     QUERY_INSTRUCTION = ("Instruct: Given a query, retrieve the passages that best answer it\nQuery: ")
@@ -93,12 +98,65 @@ def make_embedder(backend: str | None = None, **kw):
     """Return the embedder for ``backend`` (env ``REDEVOPS_RAG_EMBED_BACKEND``; default ``bge``).
 
     ``bge`` → :class:`Embedder` · ``nemotron`` → :class:`NemotronEmbedder` · ``reasonir`` →
-    :class:`~redevops_rag.temporal.ReasonIREmbedder`. One factory so the bench and the CR adapters
-    select an encoder from the environment without branching at every call site."""
+    :class:`~redevops_rag.temporal.ReasonIREmbedder` · ``colpali``/``colqwen`` →
+    :class:`~redevops_rag.multimodal.ColVisionEmbedder` (the doc-visual arm). One factory so the
+    bench and the CR adapters select an encoder from the environment without branching at every
+    call site. To route by corpus instead of a fixed backend, see :func:`encoder_for`."""
     backend = (backend or os.environ.get("REDEVOPS_RAG_EMBED_BACKEND", "bge")).strip().lower()
     if backend in ("nemotron", "nemotron-embed", "nemo"):
         return NemotronEmbedder(**kw)
     if backend == "reasonir":
         from .temporal import ReasonIREmbedder
         return ReasonIREmbedder(**kw)
+    if backend in ("colpali", "colqwen", "colvision", "colbert-vision"):
+        from .multimodal import ColVisionEmbedder
+        return ColVisionEmbedder(backend=backend, **kw)
     return Embedder(**kw)
+
+
+# ── corpus → encoder routing ────────────────────────────────────────────────────────────────
+# The cross-dataset A/B (TEMPO English vs Russian nutrition) showed NO universal best encoder:
+# cheap bge wins English, Nemotron-Embed wins Russian/domain. So the encoder is routed on the
+# *corpus* (language/domain) — a STATIC per-index binding chosen at registration time — not per
+# query (that's the retriever's bandit) and not per mission (that's model competence). Switching
+# the encoder means re-embedding the whole corpus, which is exactly why it can't be an online arm.
+#
+# Rule: English text → bge (cheap, robust, DIVER-friendly); any other KNOWN language →
+# Nemotron-Embed (multilingual/domain); page-image / doc-visual corpora → the colpali arm
+# (text-dense scans where generic CLIP underperforms); unknown language + no domain signal →
+# the cheap bge default (matches make_embedder). ENCODER_ROUTES lets a deployment pin specific
+# (lang, domain) pairs, checked before the rule; keys use "*" as a wildcard.
+ENCODER_ROUTES: dict[tuple[str, str], str] = {}
+_MULTIMODAL_DOMAINS = {"multimodal", "visual", "doc-visual", "docvisual", "scanned", "pdf-image"}
+
+
+def encoder_for(lang: str | None = None, domain: str | None = None) -> str:
+    """Resolve the encoder backend for a corpus's ``lang`` (ISO-639-1, e.g. ``en``, ``ru``) and
+    ``domain`` (free tag, e.g. ``nutrition``, ``multimodal``).
+
+    Deployment overrides in ``ENCODER_ROUTES`` win first (exact (lang, domain) → (lang, ``*``) →
+    (``*``, domain)). Otherwise: a doc-visual ``domain`` → the ``colpali`` arm regardless of
+    language; English → ``bge``; any other known language → ``nemotron``; unknown language with no
+    domain signal → the cheap ``bge`` default.
+
+    This is the retrieval-side analog of answer-side competence routing: route the encoder on the
+    corpus, the retriever on the regime, the model on measured competence."""
+    lang = (lang or "").strip().lower()
+    domain = (domain or "").strip().lower()
+    for key in ((lang or "*", domain or "*"), (lang or "*", "*"), ("*", domain or "*")):
+        if key in ENCODER_ROUTES:
+            return ENCODER_ROUTES[key]
+    if domain in _MULTIMODAL_DOMAINS:
+        return "colpali"
+    if lang == "en":
+        return "bge"
+    if lang:
+        return "nemotron"
+    return "bge"
+
+
+def make_embedder_for(lang: str | None = None, domain: str | None = None, **kw):
+    """Convenience: :func:`encoder_for` then :func:`make_embedder` — build the encoder a corpus's
+    language/domain routes to. The returned embedder's ``.backend`` is what to persist in the index
+    (see :meth:`redevops_rag.store.Store.set_meta`) so query-time reconstructs the same encoder."""
+    return make_embedder(encoder_for(lang, domain), **kw)

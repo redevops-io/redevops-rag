@@ -54,13 +54,23 @@ class ReasonIREmbedder:
           --hf-overrides '{"architectures":["LlamaBidirectionalModel"],"pooling":"avg"}'
     """
 
-    def __init__(self, url: str = "http://127.0.0.1:8012/v1/embeddings",
+    backend = "reasonir"
+
+    #: ReasonIR is instruction-tuned (arXiv:2504.20595): queries carry a task instruction,
+    #: documents don't. Applied on the query side only, via ``encode_queries``.
+    QUERY_INSTRUCTION = ("Instruct: Given a query, retrieve the passages that best answer it\nQuery: ")
+
+    def __init__(self, url: str | None = None,
                  model: str = "reasonir", dim: int = 4096, batch: int = 48,
                  max_chars: int = 6000, timeout: float = 180.0):
+        # URL resolves from REDEVOPS_RAG_REASONIR_URL (mirrors NemotronEmbedder), so make_embedder
+        # picks up an off-box endpoint from the env instead of the localhost default.
+        import os
+        url = url or os.environ.get("REDEVOPS_RAG_REASONIR_URL", "http://127.0.0.1:8012/v1/embeddings")
         self.url, self.model, self.dim = url, model, dim
         self.batch, self.max_chars, self.timeout = batch, max_chars, timeout
 
-    def encode(self, texts) -> list[list[float]]:
+    def _post(self, texts) -> list[list[float]]:
         texts, out = list(texts), []
         for i in range(0, len(texts), self.batch):
             chunk = [str(t)[: self.max_chars] for t in texts[i:i + self.batch]]
@@ -70,6 +80,14 @@ class ReasonIREmbedder:
             data = json.load(urllib.request.urlopen(req, timeout=self.timeout))
             out += [d["embedding"] for d in sorted(data["data"], key=lambda x: x["index"])]
         return out
+
+    def encode(self, texts) -> list[list[float]]:
+        return self._post(texts)
+
+    def encode_queries(self, queries) -> list[list[float]]:
+        """Embed queries WITH the reasoning instruction prefix (documents stay raw). DIVER sends
+        the reasoning-heavy *original* query here; sub-query fragments go through plain ``encode``."""
+        return self._post([self.QUERY_INSTRUCTION + str(q) for q in queries])
 
 
 class TemporalReasoningRetriever:
