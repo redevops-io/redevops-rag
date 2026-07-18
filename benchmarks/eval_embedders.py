@@ -71,8 +71,12 @@ def listwise_rerank(query, cands, top):
 
 def diver(store, query, pool=25, top=10):
     cand = {}
-    for q in [query] + expand_query(query):
-        for h in hybrid_search(store, q, limit=pool, recency_half_life_days=0):
+    # Encoder-aware DIVER (I2): the reasoning-heavy ORIGINAL query is embedded with the encoder's
+    # instruction side (query_mode='instruct'), the expanded sub-queries plain — the instruction is
+    # tuned for the full query and hurts the fragments. Symmetric bge collapses both to plain encode.
+    for i, q in enumerate([query] + expand_query(query)):
+        mode = "instruct" if i == 0 else "plain"
+        for h in hybrid_search(store, q, limit=pool, recency_half_life_days=0, query_mode=mode):
             cand.setdefault(h["document_id"], h)
     return listwise_rerank(query, list(cand.values()), top)
 
@@ -145,5 +149,6 @@ for m in METHODS:
         row += f"{scores[BACKENDS[1]][m]['ndcg'] - scores[BACKENDS[0]][m]['ndcg']:>+10.3f}"
     print(row)
 print("\n(Recall@10 / MRR per method also collected — extend the print block if you need them.)")
-print("Note: queries are embedded symmetrically. For Nemotron's asymmetric query instruction, embed "
-      "queries via NemotronEmbedder.encode_queries — expect a further lift on the vector/hybrid arms.")
+print("Note: queries now use the encoder's ASYMMETRIC side by default (hybrid_search query_mode='auto' → "
+      "encode_queries for Nemotron/ReasonIR); DIVER instructs the original + keeps sub-queries plain. "
+      "This measures I2 — expect Nemotron's hybrid/vector arms to lift vs the earlier symmetric baseline.")

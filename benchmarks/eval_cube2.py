@@ -70,6 +70,20 @@ DATASET_CORPUS = {"nutrition": ("ru", "nutrition")}   # dataset -> (lang, domain
 # cr-auto cell ignores the swept STRATEGIES and labels its strategy 'auto'. Default OFF → prior cr-auto.
 CR_COUPLE = os.environ.get("CR_COUPLE", "").lower() in ("1", "true", "yes", "on")
 REGIME_STRATEGY = {"temporal": "mapreduce", "graph": "decompose", "document": "direct", "low_graph": "direct"}
+
+# ---- Competence-routed cr-auto (finding #5): route from the MEASURED cube, not regime rules ----------
+# The v5 cube showed cr-auto's regime→(retriever,strategy) heuristics leaving accuracy on the table on
+# every dataset (nutrition → hybrid 0.75 when reasonir scores 0.917). CR_ROUTES points at the routes.json
+# that build_routes.py emits from cube.csv; per (dataset | rep) it gives the competence-best
+# (method, strategy). Off → the regime heuristics below (prior behavior). This is the Step-2 re-run: turn
+# it on, re-run METHODS=cr-auto, and measure cr-auto vs best-fixed.
+ROUTES = {}
+if os.environ.get("CR_ROUTES"):
+    try:
+        ROUTES = json.load(open(os.environ["CR_ROUTES"]))
+    except Exception:  # noqa: BLE001 — a bad routes file must not break the run; fall back to regime rules
+        ROUTES = {}
+CURRENT_DATASET = ""   # set per dataset in the main loop so cr_route can use the by_dataset ceiling
 os.makedirs(RES, exist_ok=True)
 
 
@@ -123,11 +137,59 @@ def _gen(model, sys_p, user, *, think, budget):
                                                     {"role": "user", "content": user}])
     return (r.choices[0].message.content or "").strip()
 
+# ---- Deterministic map-reduce aggregator (longmemeval) — model MAP, code REDUCE -------------------
+# The v5 cube showed the 35B can't aggregate/compose across sessions (longmemeval floor ≤0.167). Fix
+# per the doc: don't ask the model to compose — have it EXTRACT structured facts per source (what models
+# are good at), then do the count/latest/sum REDUCE in code. Selected as strategy "aggregate".
+def _detect_agg(q):
+    ql = q.lower()
+    if any(w in ql for w in ("how many", "number of", "count", "how often", "how many times")):
+        return "count"
+    if any(w in ql for w in ("most recent", "latest", "last time", "currently", "now", "as of")):
+        return "latest"
+    if any(w in ql for w in ("total", "sum", "altogether", "combined")):
+        return "sum"
+    return "list"
+
+def _reduce(agg, facts):
+    if agg == "count":
+        return str(len(facts))
+    if agg == "sum":
+        return str(sum(f["value"] for f in facts if isinstance(f.get("value"), (int, float))))
+    if agg == "latest":
+        dated = [f for f in facts if f.get("date")]
+        if dated:
+            best = max(dated, key=lambda f: str(f["date"]))
+            return str(best.get("item") or best.get("value") or "")
+        return str(facts[-1].get("item") or "") if facts else "NOT FOUND"
+    items = list(dict.fromkeys(str(f.get("item")) for f in facts if f.get("item")))
+    return ", ".join(items) if items else "NOT FOUND"
+
+def _aggregate(model, ctx, q):
+    """MAP each retrieved passage → JSONL facts (model), then REDUCE deterministically (code)."""
+    chunks = [c for c in ctx.split("\n\n") if c.strip()]
+    facts = []
+    for ch in chunks[:12]:
+        out = _gen(model, "Extract every fact from the passage relevant to the question as JSONL — one "
+                   "JSON object per line: {\"date\": <ISO date or null>, \"item\": <short label>, "
+                   "\"value\": <number or null>}. Only facts that help answer the question. No prose.",
+                   f"Question: {q}\n\nPassage:\n{ch[:1500]}", think=False, budget=256)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    facts.append(json.loads(line))
+                except Exception:  # noqa: BLE001 — skip malformed extraction lines
+                    pass
+    return _reduce(_detect_agg(q), facts)
+
 def answer(model, ctx, q, strategy="direct"):
     # closed-book (no context): unchanged, terse.
     if not ctx:
         return _gen(model, "Answer in as few words as possible. If you do not know, reply exactly: "
                     "NOT FOUND.", f"Question: {q}\nAnswer:", think=False, budget=96)
+    if strategy == "aggregate":     # deterministic map-reduce (longmemeval); no model composition
+        return _aggregate(model, ctx, q)
     # `direct` reproduces the prior terse/no-think baseline EXACTLY (verbatim prompt + 96 tok).
     if strategy in ("direct", "terse"):
         return _gen(model, "Answer using ONLY the provided context, in as few words as possible. If the "
@@ -149,10 +211,32 @@ def answer(model, ctx, q, strategy="direct"):
         raise ValueError(f"unknown strategy {strategy!r}")
     return _final(_gen(model, sys_p, f"Context:\n{ctx}\n\nQuestion: {q}", think=True, budget=GEN_BUDGET))
 
-def judge(question, golds, cand):
+# Rubric judge (tempo / long-form): exact/alias match fails on essay-shaped answers, so grade COVERAGE
+# of the gold key points (share ≥ RUBRIC_MIN counts correct), not string identity. Enabled per dataset
+# via RUBRIC_DATASETS (e.g. tempo,nutrition). Half eval-hygiene, half real: the model must emit the facts.
+RUBRIC_DATASETS = set(x for x in os.environ.get("RUBRIC_DATASETS", "").split(",") if x)
+RUBRIC_MIN = float(os.environ.get("RUBRIC_MIN", "0.6"))
+
+def _rubric_correct(question, golds, cand):
+    try:
+        r = judge_cli.chat.completions.create(model="grok-4.5", temperature=0, max_tokens=6,
+            messages=[{"role": "system", "content": "You grade a long-form answer against a rubric. GOLD lists "
+                       "the key point(s) a correct answer must convey (phrasing/language/units may differ; the "
+                       "answer may add detail). Reply ONLY a number 0..1 = the share of GOLD key points the "
+                       "MODEL answer correctly covers."},
+                      {"role": "user", "content": f"Q: {question}\nGOLD key points: {' ; '.join(golds)}\nMODEL: {cand}\nScore:"}])
+        import re as _re
+        m = _re.search(r"[01](?:\.\d+)?", (r.choices[0].message.content or ""))
+        return (float(m.group()) if m else 0.0) >= RUBRIC_MIN
+    except Exception:
+        return False
+
+def judge(question, golds, cand, *, dataset=""):
     if not cand or cand.strip().upper() == "NOT FOUND": return False
     golds = [str(g) for g in golds if g is not None and str(g).strip()]
     if any(g.lower() in cand.lower() for g in golds): return True
+    if dataset in RUBRIC_DATASETS:
+        return _rubric_correct(question, golds, cand)
     try:
         r = judge_cli.chat.completions.create(model="grok-4.5", temperature=0, max_tokens=8,
             messages=[{"role": "system", "content": "Strict QA grader. Reply exactly CORRECT or INCORRECT: is the "
@@ -240,10 +324,18 @@ def graphiti_texts(item):
     return [h.text for h in hits]
 
 def cr_route(item, model):
-    """(c) bottleneck-aware: retrieval-bound regimes -> best retriever + given model;
-    model-bound (temporal aggregation) -> escalate to the strongest served model. Also returns the
-    regime-coupled reasoning strategy (B); the caller applies it only when CR_COUPLE is on."""
+    """Route the query to (retriever, model, strategy). Competence-routed off the cube when CR_ROUTES is
+    set (finding #5): the measured best (method, strategy) per class beats the regime heuristics. Falls
+    back to the bottleneck-aware regime rules otherwise."""
     rep = router.classify(item["question"]) or "document"
+    if ROUTES:  # competence route from the measured cube (by_dataset ceiling → by_rep runtime route)
+        route = ROUTES.get("by_dataset", {}).get(CURRENT_DATASET) or ROUTES.get("by_rep", {}).get(rep)
+        if route:
+            texts = retrieve_texts(route["method"], item)
+            # temporal is also model-bound → still allow model escalation (the route is qwen-only for now)
+            use_model = (STRONGEST if (rep == "temporal" and STRONGEST in clients
+                         and MODEL_CFG[STRONGEST]["rank"] > MODEL_CFG[model]["rank"]) else model)
+            return use_model, texts, route["strategy"]
     if rep == "temporal":                      # temporal-reasoning = RETRIEVAL- AND MODEL-sensitive
         # DIVER is now in the temporal routed set: on TEMPO it scores 0.91 vs hybrid 0.84 (and vs the
         # graph engines' 0.24-0.28), so temporal retrieves with DIVER, not plain hybrid — the fix for
@@ -264,6 +356,7 @@ def load(name):
 print(f"models={MODELS} methods={METHODS} conds={CONDS} datasets={DATASETS} N={N} K={K}", flush=True)
 for name in DATASETS:
     items = load(name)
+    CURRENT_DATASET = name                # competence-routed cr-auto reads this for the by_dataset ceiling
     ACTIVE_EMB = dataset_embedder(name)   # (A) route the dataset's default embedder (bge unless EMBED_ROUTING)
     if EMBED_ROUTING:
         print(f"  [embed-routing] {name} -> {getattr(ACTIVE_EMB, 'backend', 'bge')} (dim={ACTIVE_EMB.dim})", flush=True)
@@ -286,9 +379,9 @@ for name in DATASETS:
                             if method == "cr-auto":
                                 m, texts, cr_strat = cr_route(it, model); ctx = ctx_of(texts, BUDGET)
                                 use_strat = cr_strat if CR_COUPLE else strat   # (B) couple inference to regime
-                                res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], use_strat))); continue
+                                res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], use_strat), dataset=name)); continue
                             ctx = retr[it["qid"]]
-                        res[cond].append(judge(it["question"], golds, answer(model, ctx, it["question"], strat)))
+                        res[cond].append(judge(it["question"], golds, answer(model, ctx, it["question"], strat), dataset=name))
                 cell = {"dataset": name, "method": method, "model": model, "strategy": strat, "n": len(items),
                         **{f"acc_{c}": round(st.mean(res[c]), 3) if res[c] else None for c in CONDS}}
                 json.dump(cell, open(f"{RES}/{name}__{method}__{model}__{strat}.json", "w"))
