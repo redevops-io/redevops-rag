@@ -50,6 +50,11 @@ NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}}
 #     MODELS=qwen METHODS=hybrid N=12 <venv>/bin/python benchmarks/eval_cube2.py
 STRATEGIES = os.environ.get("STRATEGIES", "direct").split(",")
 GEN_BUDGET = int(os.environ.get("GEN_BUDGET", "768"))       # token budget for reasoning strategies
+# `direct_think` (Run 2): native model reasoning (enable_thinking=True) with a TERSE/direct answer prompt
+# — the model thinks, we do NOT add CoT scaffolding (that was the refuted, unstable `reason` strategy).
+# Isolates model reasoning from prompt strategy. Needs a generous budget so the <think> trace + final
+# answer fit; a trace that hits max_tokens loses its final line (tracked as truncation).
+THINK_BUDGET = int(os.environ.get("THINK_BUDGET", "4096"))
 # Recalibrated abstention (Step 4): don't bail when the pieces are present — the cure for over-abstention.
 _ABSTAIN = ("If the pieces needed to answer are present in the context, reason across them and answer; "
             "reply exactly NOT FOUND only if the context truly lacks the answer.")
@@ -130,11 +135,16 @@ def reason_llm(system, user):
         extra_body=NOTHINK, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
     return (r.choices[0].message.content or "").strip()
 
+_TRUNC = {"n": 0, "total": 0}   # truncation counter: completions that hit max_tokens (finish_reason=length)
+
 def _gen(model, sys_p, user, *, think, budget):
     c = MODEL_CFG[model]
     r = clients[model].chat.completions.create(model=c["model"], temperature=0, max_tokens=budget,
         extra_body=_extra(model, think), messages=[{"role": "system", "content": sys_p},
                                                     {"role": "user", "content": user}])
+    _TRUNC["total"] += 1
+    if getattr(r.choices[0], "finish_reason", None) == "length":  # trace hit the budget → answer may be lost
+        _TRUNC["n"] += 1
     return (r.choices[0].message.content or "").strip()
 
 # ---- Deterministic map-reduce aggregator (longmemeval) — model MAP, code REDUCE -------------------
@@ -190,6 +200,14 @@ def answer(model, ctx, q, strategy="direct"):
                     "NOT FOUND.", f"Question: {q}\nAnswer:", think=False, budget=96)
     if strategy == "aggregate":     # deterministic map-reduce (longmemeval); no model composition
         return _aggregate(model, ctx, q)
+    if strategy == "direct_think":  # NATIVE reasoning (thinking on) + terse prompt — NO CoT scaffolding.
+        # Same direct instruction as the baseline; the model reasons in <think>, we extract the final.
+        # This is the Run-2 answerer test: model reasoning ⟂ the (refuted) prompt strategies.
+        return _final(_gen(model,
+            "Answer using ONLY the provided context. Give the final answer only — as few words as "
+            "possible — on a line beginning 'Answer:'. If the answer is not in the context, reply "
+            "exactly: NOT FOUND.",
+            f"Context:\n{ctx}\n\nQuestion: {q}", think=True, budget=THINK_BUDGET))
     # `direct` reproduces the prior terse/no-think baseline EXACTLY (verbatim prompt + 96 tok).
     if strategy in ("direct", "terse"):
         return _gen(model, "Answer using ONLY the provided context, in as few words as possible. If the "
@@ -386,4 +404,7 @@ for name in DATASETS:
                         **{f"acc_{c}": round(st.mean(res[c]), 3) if res[c] else None for c in CONDS}}
                 json.dump(cell, open(f"{RES}/{name}__{method}__{model}__{strat}.json", "w"))
                 print(f"  {name:11} {method:8} {model:9} {strat:9} " + " ".join(f"{c}={cell.get('acc_'+c)}" for c in CONDS), flush=True)
+if _TRUNC["total"]:
+    print(f"truncation: {_TRUNC['n']}/{_TRUNC['total']} completions hit max_tokens "
+          f"({100*_TRUNC['n']/_TRUNC['total']:.1f}%) — raise THINK_BUDGET if high (lost final answers)", flush=True)
 print("CUBE2_DONE", flush=True)
