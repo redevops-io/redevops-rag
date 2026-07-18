@@ -5,10 +5,20 @@ cell on every dataset — nutrition routed to hybrid (0.75) when reasonir scores
 route from the MEASURED cube, not hand-coded regime rules. This reads the cube and emits, per class,
 the (method, strategy) that actually scored best — the table cr-auto routes from.
 
+**Route on the SERVED metric.** cr-auto is measured at *retrieved*, so the route is selected by
+``acc_retrieved`` by default — NOT acc_oracle. The v6 Run-1 lesson (with teeth): promoting on
+acc_oracle picked document→reasonir/reason (reason's *oracle* on nutrition is 0.917), but reason needs
+perfect context and **collapses at retrieved** (0.583 vs direct's 0.917), so oracle-routed cr-auto got
+*worse* than the regime baseline. The oracle cell is the generation-competence diagnostic (and the
+strategy-ladder prior, see build_priors.py); the end-to-end ROUTE must be chosen on what actually ships.
+``SELECT_COND=acc_oracle`` restores the old (wrong-for-routing) behavior; ``ROBUST=1`` scores by
+min(oracle, retrieved) to hedge N=12 retrieved-noise (a route that must work BOTH given good context
+and end-to-end).
+
 Input: the cube CSV (``CUBE_CSV``; columns dataset,method,model,strategy,n,acc_closed,acc_oracle,
 acc_retrieved) — the ``fixed`` method rows only (cr-auto's own row is skipped). Selection is by
-``acc_oracle`` (generation isolated from retrieval — the promote signal), tie-broken by acc_retrieved
-then the cheaper method. Emits two granularities:
+``acc_retrieved`` (the served objective), tie-broken by the other condition (robustness) then the
+cheaper method. Emits two granularities:
 
   by_dataset — the competence CEILING: the best cell per dataset (what cr-auto could reach if it knew
                the class perfectly). Used by the benchmark to measure the routing LIFT.
@@ -25,7 +35,8 @@ import os
 
 CUBE_CSV = os.environ.get("CUBE_CSV", "cube_results/cube.csv")
 OUT = os.environ.get("OUT", "routes.json")
-SELECT = os.environ.get("SELECT_COND", "acc_oracle")   # promote on oracle; acc_retrieved to route on served
+SELECT = os.environ.get("SELECT_COND", "acc_retrieved")   # route on the SERVED metric (Run-1 lesson)
+ROBUST = os.environ.get("ROBUST", "").lower() in ("1", "true", "yes", "on")  # score min(oracle,retrieved)
 FIXED_METHODS = {"bm25", "hybrid", "reasonir", "diver", "graphiti", "hipporag"}
 
 # dataset → the router representation it classifies as (aggregation key for by_rep).
@@ -42,12 +53,19 @@ def _num(x):
         return None
 
 
+def _score(c):
+    """Primary selection score: min(oracle,retrieved) when ROBUST (must work both ways), else SELECT."""
+    o, r = _num(c.get("acc_oracle")), _num(c.get("acc_retrieved"))
+    if ROBUST:
+        return min(o if o is not None else -1.0, r if r is not None else -1.0)
+    return _num(c.get(SELECT)) or -1.0
+
+
 def best_cell(cells):
-    """The (method, strategy) with the highest SELECT score, tie-broken by acc_retrieved then cheaper."""
-    def key(c):
-        return (_num(c.get(SELECT)) or -1.0, _num(c.get("acc_retrieved")) or -1.0,
-                -METHOD_COST.get(c["method"], 9))
-    best = max(cells, key=key)
+    """The (method, strategy) with the best served score, tie-broken by the OTHER condition (robustness)
+    then the cheaper method."""
+    other = "acc_oracle" if SELECT == "acc_retrieved" else "acc_retrieved"
+    best = max(cells, key=lambda c: (_score(c), _num(c.get(other)) or -1.0, -METHOD_COST.get(c["method"], 9)))
     return {"method": best["method"], "strategy": best["strategy"],
             "oracle": _num(best.get("acc_oracle")), "retrieved": _num(best.get("acc_retrieved"))}
 
@@ -68,8 +86,8 @@ def main():
     rep_cells = {}
     for r in rows:
         rep = DATASET_REP.get(r["dataset"], "document")
-        v = _num(r.get(SELECT))
-        if v is None:
+        v = _score(r)
+        if v < 0:
             continue
         rep_cells.setdefault(rep, {}).setdefault((r["method"], r["strategy"]), []).append(v)
     by_rep = {}
