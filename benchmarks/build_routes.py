@@ -42,9 +42,10 @@ FIXED_METHODS = {"bm25", "hybrid", "reasonir", "diver", "graphiti", "hipporag"}
 # only don't beat direct at oracle (refuted), they're NON-REPRODUCIBLE — a re-run of the *same* route
 # flips 2-3 of 12 (long, variance-prone outputs: musique diver/reason 0.667→0.417, longmemeval
 # diver/decompose 0.167→0.00), so routing to them is unstable. Every `direct` route reproduced exactly.
-# Drop them; keep direct + the deterministic `aggregate` (code-reduce). DROP_STRATEGIES overrides.
+# Drop them; keep `direct` (deterministic). `aggregate` was also dropped (Run-2 audit: 0.083 < direct
+# 0.333 at full gold — extract-reduce loses info vs full-context reasoning). DROP_STRATEGIES overrides.
 DROP_STRATEGIES = set(s for s in os.environ.get(
-    "DROP_STRATEGIES", "reason,decompose,mapreduce").split(",") if s)
+    "DROP_STRATEGIES", "reason,decompose,mapreduce,aggregate").split(",") if s)
 
 # dataset → the router representation it classifies as (aggregation key for by_rep).
 DATASET_REP = {"popqa": "document", "nutrition": "document", "musique": "graph",
@@ -104,16 +105,6 @@ def main():
             ((k, sum(v) / len(v)) for k, v in combos.items()),
             key=lambda kv: (kv[1], -METHOD_COST.get(kv[0][0], 9)))
         by_rep[rep] = {"method": method, "strategy": strategy, "score": round(mean, 4)}
-
-    # AGG_TEMPORAL=1: point temporal at the NEW deterministic map-reduce aggregator (strategy
-    # "aggregate") instead of the cube's mapreduce — the 35B can't compose across sessions, so the
-    # next run reduces in code. Only affects temporal datasets/rep; the retriever is kept.
-    if os.environ.get("AGG_TEMPORAL", "").lower() in ("1", "true", "yes", "on"):
-        for ds, r in by_dataset.items():
-            if DATASET_REP.get(ds) == "temporal":
-                r["strategy"] = "aggregate"
-        if "temporal" in by_rep:
-            by_rep["temporal"]["strategy"] = "aggregate"
 
     payload = {"select_cond": SELECT, "by_dataset": by_dataset, "by_rep": by_rep,
                "dataset_rep": DATASET_REP}

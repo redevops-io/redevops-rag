@@ -35,6 +35,17 @@ CONDS = os.environ.get("CONDS", "closed,oracle,retrieved").split(",")
 N = int(os.environ.get("N", "12"))
 K = int(os.environ.get("K", "8"))          # raised from 6 (d): more room for both multi-hop bridges
 BUDGET = int(os.environ.get("BUDGET", "3000"))
+# Context-budget fix (Run-2 audit): the longmemeval "ceiling" was ctx_of TRUNCATING gold — gold contexts
+# are 22k–75k chars but BUDGET=3000 caps oracle at 12k, so models were graded on sessions they never saw.
+# Fixing it lifted qwen-35B oracle 0.083→0.333 for free (and Kimi→0.75). ORACLE shows FULL gold; long
+# multi-session datasets get a larger retrieved budget too. (tempo is a broken dataset — essay gold — see
+# the audit; rebuild or drop, not a budget issue.)
+ORACLE_BUDGET = int(os.environ.get("ORACLE_BUDGET", "24000"))    # ~96k chars — covers the largest gold
+DATASET_BUDGET = {"longmemeval": int(os.environ.get("LONGMEM_BUDGET", "24000"))}
+
+def ctx_budget(dataset, cond):
+    """Oracle = full gold (never truncate the ceiling); retrieved = per-dataset (long inputs get room)."""
+    return ORACLE_BUDGET if cond == "oracle" else DATASET_BUDGET.get(dataset, BUDGET)
 NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}}
 # ---- Phase-0 generation-strategy ablation (the answer-plane axis) --------------------------------
 # STRATEGIES sweeps the generation strategy per cell, isolating GENERATION from retrieval (run with
@@ -115,7 +126,7 @@ def _final(out):
 # serve-and-swap driver fills the port it brings each model up on. tier drives default N. ----
 MODEL_CFG = {
     "qwen":       {"url": "http://192.168.40.105:30807/v1", "model": "Qwen3.6-35B-A3B",   "extra": NOTHINK, "tier": "gpu", "rank": 2},
-    "qwen35":     {"url": os.environ.get("QWEN35_URL"),     "model": "Qwen3.5-122B",      "extra": {},       "tier": "cpu", "rank": 3},
+    "qwen35":     {"url": os.environ.get("QWEN35_URL"),     "model": "Qwen3.5-122B",      "extra": NOTHINK,  "tier": "cpu", "rank": 3},
     "mistral":    {"url": os.environ.get("MISTRAL_URL"),    "model": "mistral-small-24b", "extra": {},       "tier": "gpu", "rank": 1},
     "gemma":      {"url": os.environ.get("GEMMA_URL"),      "model": "gemma4-26b-a4b",    "extra": NOTHINK,  "tier": "gpu", "rank": 1},
     "nemotron":   {"url": os.environ.get("NEMOTRON_URL"),   "model": "nemotron3-nano-30b","extra": NOTHINK,  "tier": "gpu", "rank": 2},
@@ -169,59 +180,16 @@ def _gen(model, sys_p, user, *, think, budget):
         _TRUNC["n"] += 1
     return (r.choices[0].message.content or "").strip()
 
-# ---- Deterministic map-reduce aggregator (longmemeval) — model MAP, code REDUCE -------------------
-# The v5 cube showed the 35B can't aggregate/compose across sessions (longmemeval floor ≤0.167). Fix
-# per the doc: don't ask the model to compose — have it EXTRACT structured facts per source (what models
-# are good at), then do the count/latest/sum REDUCE in code. Selected as strategy "aggregate".
-def _detect_agg(q):
-    ql = q.lower()
-    if any(w in ql for w in ("how many", "number of", "count", "how often", "how many times")):
-        return "count"
-    if any(w in ql for w in ("most recent", "latest", "last time", "currently", "now", "as of")):
-        return "latest"
-    if any(w in ql for w in ("total", "sum", "altogether", "combined")):
-        return "sum"
-    return "list"
-
-def _reduce(agg, facts):
-    if agg == "count":
-        return str(len(facts))
-    if agg == "sum":
-        return str(sum(f["value"] for f in facts if isinstance(f.get("value"), (int, float))))
-    if agg == "latest":
-        dated = [f for f in facts if f.get("date")]
-        if dated:
-            best = max(dated, key=lambda f: str(f["date"]))
-            return str(best.get("item") or best.get("value") or "")
-        return str(facts[-1].get("item") or "") if facts else "NOT FOUND"
-    items = list(dict.fromkeys(str(f.get("item")) for f in facts if f.get("item")))
-    return ", ".join(items) if items else "NOT FOUND"
-
-def _aggregate(model, ctx, q):
-    """MAP each retrieved passage → JSONL facts (model), then REDUCE deterministically (code)."""
-    chunks = [c for c in ctx.split("\n\n") if c.strip()]
-    facts = []
-    for ch in chunks[:12]:
-        out = _gen(model, "Extract every fact from the passage relevant to the question as JSONL — one "
-                   "JSON object per line: {\"date\": <ISO date or null>, \"item\": <short label>, "
-                   "\"value\": <number or null>}. Only facts that help answer the question. No prose.",
-                   f"Question: {q}\n\nPassage:\n{ch[:1500]}", think=False, budget=256)
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    facts.append(json.loads(line))
-                except Exception:  # noqa: BLE001 — skip malformed extraction lines
-                    pass
-    return _reduce(_detect_agg(q), facts)
+# The deterministic map-reduce aggregator (strategy "aggregate") was REFUTED by the Run-2 audit: at FULL
+# gold it scored 0.083 on longmemeval, WORSE than plain `direct` 0.333 — extract-then-reduce loses
+# information vs letting a thinking model reason over the full context. Dropped. The real lever for the
+# aggregation lane is a thinking answerer over full context (Kimi-k2.6 = 0.75), not code-side reduce.
 
 def answer(model, ctx, q, strategy="direct"):
     # closed-book (no context): unchanged, terse.
     if not ctx:
         return _gen(model, "Answer in as few words as possible. If you do not know, reply exactly: "
                     "NOT FOUND.", f"Question: {q}\nAnswer:", think=False, budget=96)
-    if strategy == "aggregate":     # deterministic map-reduce (longmemeval); no model composition
-        return _aggregate(model, ctx, q)
     if strategy == "direct_think":  # NATIVE reasoning (thinking on) + terse prompt — NO CoT scaffolding.
         # Same direct instruction as the baseline; the model reasons in <think>, we extract the final.
         # This is the Run-2 answerer test: model reasoning ⟂ the (refuted) prompt strategies.
@@ -405,7 +373,7 @@ for name in DATASETS:
         # precompute retrieved context per item (reused across models & conds)
         retr = {}
         if "retrieved" in CONDS and method != "cr-auto":
-            for it in items: retr[it["qid"]] = ctx_of(retrieve_texts(method, it), BUDGET)
+            for it in items: retr[it["qid"]] = ctx_of(retrieve_texts(method, it), ctx_budget(name, "retrieved"))
         for model in MODELS:
             if model not in clients: continue
             for strat in STRATEGIES:            # generation-strategy axis (Phase-0 answer-plane ablation)
@@ -414,10 +382,10 @@ for name in DATASETS:
                     golds = [it["answer"], *it.get("aliases", [])]
                     for cond in CONDS:
                         if cond == "closed":   ctx = ""
-                        elif cond == "oracle": ctx = ctx_of(goldtext[it["qid"]], BUDGET)
+                        elif cond == "oracle": ctx = ctx_of(goldtext[it["qid"]], ctx_budget(name, "oracle"))
                         else:  # retrieved
                             if method == "cr-auto":
-                                m, texts, cr_strat = cr_route(it, model); ctx = ctx_of(texts, BUDGET)
+                                m, texts, cr_strat = cr_route(it, model); ctx = ctx_of(texts, ctx_budget(name, "retrieved"))
                                 use_strat = cr_strat if CR_COUPLE else strat   # (B) couple inference to regime
                                 res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], use_strat), dataset=name)); continue
                             ctx = retr[it["qid"]]
