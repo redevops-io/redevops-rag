@@ -117,7 +117,7 @@ MODEL_CFG = {
     "qwen":       {"url": "http://192.168.40.105:30807/v1", "model": "Qwen3.6-35B-A3B",   "extra": NOTHINK, "tier": "gpu", "rank": 2},
     "qwen35":     {"url": os.environ.get("QWEN35_URL"),     "model": "Qwen3.5-122B",      "extra": {},       "tier": "cpu", "rank": 3},
     "mistral":    {"url": os.environ.get("MISTRAL_URL"),    "model": "mistral-small-24b", "extra": {},       "tier": "gpu", "rank": 1},
-    "gemma":      {"url": os.environ.get("GEMMA_URL"),      "model": "gemma4-26b-a4b",    "extra": {},       "tier": "gpu", "rank": 1},
+    "gemma":      {"url": os.environ.get("GEMMA_URL"),      "model": "gemma4-26b-a4b",    "extra": NOTHINK,  "tier": "gpu", "rank": 1},
     "nemotron":   {"url": os.environ.get("NEMOTRON_URL"),   "model": "nemotron3-nano-30b","extra": NOTHINK,  "tier": "gpu", "rank": 2},
     "coder":      {"url": os.environ.get("CODER_URL"),      "model": "Qwen3.6-Coder-Next","extra": NOTHINK,  "tier": "cpu", "rank": 3},
     "nemosuper":  {"url": os.environ.get("NEMOSUPER_URL"),  "model": "Nemotron-3-Super",  "extra": NOTHINK,  "tier": "cpu", "rank": 4},
