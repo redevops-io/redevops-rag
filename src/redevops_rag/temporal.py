@@ -123,5 +123,22 @@ class TemporalReasoningRetriever:
                             document_ids=document_ids,
                             recency_half_life_days=recency_half_life_days)
 
+    def insert(self, store, docs, *, embedder=None, reindex: bool = True) -> int:
+        """Incrementally add documents to the store DIVER retrieves over — NO index rebuild. DIVER is
+        index-free (query-time expand → retrieve → rerank), so a new document is simply embedded and
+        upserted, and the very next ``search`` sees it. This is the streaming/live-corpus update path
+        (parity with the graph engines' incremental ``insert``): a corpus that grows — new sessions,
+        edited docs — extends in place instead of rebuilding. ``docs`` = list of ``{text, document_id?,
+        metadata?}``; returns the number of chunks added. Uses the store's own embedder by default so the
+        new documents live in the SAME vector space the queries are encoded in (see encoder routing)."""
+        emb = embedder or store.embedder
+        chunks = [{"document_id": d.get("document_id") or d.get("chunk_id"),
+                   "text": d["text"], "metadata": d.get("metadata") or {}} for d in docs]
+        if not chunks:
+            return 0
+        for c, e in zip(chunks, emb.encode([c["text"] for c in chunks])):
+            c["embedding"] = e
+        return store.add_chunks(chunks, reindex=reindex)
+
     # callable form so it slots straight into a bandit arm's retrieve hook
     __call__ = search
