@@ -127,8 +127,14 @@ MODEL_CFG = {
     # model breaks it) or task/eval-bound (it won't)?" without the 122B local-infra blocker. Configure
     # entirely by env: ANSWERER_URL / ANSWERER_MODEL / ANSWERER_KEY. Frontier reasoners think natively,
     # so run it with STRATEGIES=direct (terse prompt; no enable_thinking toggle needed).
-    "api":        {"url": os.environ.get("ANSWERER_URL"),  "model": os.environ.get("ANSWERER_MODEL", ""),
-                   "extra": {}, "tier": "api", "rank": 9, "api_key_env": "ANSWERER_KEY"},
+    # Defaults target Kimi (Moonshot) — a frontier reasoner ≠ the grok judge. Override with ANSWERER_*.
+    # kimi-k2.6 reasons natively + returns EMPTY without a GENEROUS budget (reasoning eats the tokens) and
+    # needs a temperature it accepts (its serve config uses 1, not 0) — both handled in _gen.
+    "api":        {"url": os.environ.get("ANSWERER_URL") or os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1"),
+                   "model": os.environ.get("ANSWERER_MODEL") or os.environ.get("KIMI_MODEL", "kimi-k2.6"),
+                   "extra": {}, "tier": "api", "rank": 9,
+                   "api_key_env": "ANSWERER_KEY" if os.environ.get("ANSWERER_KEY") else "KIMI_API_KEY",
+                   "temperature": float(os.environ.get("ANSWERER_TEMP", "0.6"))},
 }
 STRONGEST = "deepseek"   # for CR-auto model escalation on model-bound queries
 QWEN = OpenAI(base_url="http://192.168.40.105:30807/v1", api_key="EMPTY")
@@ -152,7 +158,10 @@ _TRUNC = {"n": 0, "total": 0}   # truncation counter: completions that hit max_t
 
 def _gen(model, sys_p, user, *, think, budget):
     c = MODEL_CFG[model]
-    r = clients[model].chat.completions.create(model=c["model"], temperature=0, max_tokens=budget,
+    temp = c.get("temperature", 0)          # per-model: local vLLM=0; reasoning API upstreams need >0
+    if c.get("tier") == "api":              # a native-reasoning upstream eats budget → floor it generously
+        budget = max(budget, THINK_BUDGET)  # else kimi-k2.6 returns EMPTY (reasoning consumed all tokens)
+    r = clients[model].chat.completions.create(model=c["model"], temperature=temp, max_tokens=budget,
         extra_body=_extra(model, think), messages=[{"role": "system", "content": sys_p},
                                                     {"role": "user", "content": user}])
     _TRUNC["total"] += 1
