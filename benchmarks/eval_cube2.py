@@ -122,13 +122,26 @@ MODEL_CFG = {
     "coder":      {"url": os.environ.get("CODER_URL"),      "model": "Qwen3.6-Coder-Next","extra": NOTHINK,  "tier": "cpu", "rank": 3},
     "nemosuper":  {"url": os.environ.get("NEMOSUPER_URL"),  "model": "Nemotron-3-Super",  "extra": NOTHINK,  "tier": "cpu", "rank": 4},
     "deepseek":   {"url": "http://192.168.40.105:8001/v1",  "model": "DeepSeek-V4-Flash", "extra": {},       "tier": "cpu", "rank": 5},
+    # Generic API answerer — the infra-free CAPACITY PROBE (Run 2). Point it at any OpenAI-compatible
+    # frontier reasoning endpoint to answer "is the longmemeval/tempo ceiling capacity-bound (a bigger
+    # model breaks it) or task/eval-bound (it won't)?" without the 122B local-infra blocker. Configure
+    # entirely by env: ANSWERER_URL / ANSWERER_MODEL / ANSWERER_KEY. Frontier reasoners think natively,
+    # so run it with STRATEGIES=direct (terse prompt; no enable_thinking toggle needed).
+    "api":        {"url": os.environ.get("ANSWERER_URL"),  "model": os.environ.get("ANSWERER_MODEL", ""),
+                   "extra": {}, "tier": "api", "rank": 9, "api_key_env": "ANSWERER_KEY"},
 }
 STRONGEST = "deepseek"   # for CR-auto model escalation on model-bound queries
 QWEN = OpenAI(base_url="http://192.168.40.105:30807/v1", api_key="EMPTY")
 judge_cli = OpenAI(base_url="https://api.x.ai/v1", api_key=os.environ["XAI_API_KEY"])
 router = OpenAICompatModel("http://192.168.40.105:30807/v1", "Qwen3.6-35B-A3B")
-clients = {m: OpenAI(base_url=MODEL_CFG[m]["url"], api_key="EMPTY", timeout=900)
+# api_key per model: an API answerer reads its key from api_key_env; local vLLM stays "EMPTY".
+clients = {m: OpenAI(base_url=MODEL_CFG[m]["url"],
+                     api_key=(os.environ.get(MODEL_CFG[m].get("api_key_env", ""), "") or "EMPTY"), timeout=900)
            for m in MODELS if MODEL_CFG[m]["url"]}
+if "api" in clients and "grok" in (MODEL_CFG["api"]["model"] or "").lower():
+    print("WARNING: the API answerer is grok — same family as the judge (grok-4.5) → self-grading "
+          "circularity. Use a DIFFERENT frontier model as the answerer, or read the result with that "
+          "caveat.", flush=True)
 
 def reason_llm(system, user):
     r = QWEN.chat.completions.create(model="Qwen3.6-35B-A3B", temperature=0, max_tokens=120,
