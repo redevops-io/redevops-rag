@@ -283,7 +283,11 @@ def dataset_embedder(name):
 def _store(item, embedder):
     dbp = f"/tmp/c2_{id(embedder)%9999}_{item['qid']}.duckdb"
     if os.path.exists(dbp): os.remove(dbp)
-    s = Store(embedder, dbp)
+    # Fix 2 wiring: an RU corpus (nutrition) needs the Russian FTS stemmer, else BM25 uses English Porter
+    # and misses inflected matches (Фолиновую ↛ фолиновая). English corpora keep the porter/english default.
+    lang, _dom = DATASET_CORPUS.get(CURRENT_DATASET, ("en", ""))
+    fts = {"fts_stemmer": "russian", "fts_stopwords": "none"} if lang == "ru" else {}
+    s = Store(embedder, dbp, **fts)
     ch = [{"document_id": d["chunk_id"], "text": d["text"], "metadata": {}} for d in item["docs"]]
     for c, e in zip(ch, embedder.encode([x["text"] for x in ch])): c["embedding"] = e
     s.add_chunks(ch, reindex=True); return s
