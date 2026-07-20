@@ -24,6 +24,12 @@ DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"  # 384-d, strong for retrieval, small e
 class Embedder:
     #: backend tag persisted in the index so query-time reconstructs the SAME encoder (see open_store).
     backend = "bge"
+    #: default cosine floor for the dense leg — the noise threshold BELOW which a hit is discarded. This
+    #: is PER-ENCODER: bge sims are well-separated (~0.85 on-topic), so 0.4 is a real floor. A single
+    #: global 0.4 silently kills encoders whose sim distribution is compressed (see NemotronEmbedder) —
+    #: their vector leg returns nothing and "hybrid" degenerates to BM25-only, discarding the paid-for
+    #: encoder. Stores resolve threshold=None to this value.
+    sim_floor = 0.4
 
     def __init__(self, model_name: str | None = None, device: str | None = None):
         from sentence_transformers import SentenceTransformer  # lazy: heavy import
@@ -59,6 +65,10 @@ class NemotronEmbedder:
     """
 
     backend = "nemotron"
+    #: Nemotron-3-Embed's cosine sims are COMPRESSED vs bge (measured ~0.28–0.54 on-topic, not ~0.85),
+    #: so the bge-calibrated 0.4 floor throws the gold chunk (which it ranks #1) out. A low floor keeps
+    #: the top ranks; RRF/rerank order them. Verified: at 0.4 the Nemotron vector leg returns ~nothing.
+    sim_floor = 0.1
 
     #: NV/Nemotron retrieval instruction; prepended to queries only (documents are embedded raw).
     QUERY_INSTRUCTION = ("Instruct: Given a query, retrieve the passages that best answer it\nQuery: ")

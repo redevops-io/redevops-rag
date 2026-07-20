@@ -7,15 +7,34 @@ extension and soft-fails to an empty sparse leg if it can't load.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 import duckdb
 
+_FTS_IDENT = re.compile(r"^[a-z_]+$")
+
+
+def _fts_ident(name: str) -> str:
+    """Validate an FTS stemmer/stopwords name before interpolating it into the create_fts_index PRAGMA
+    (DuckDB doesn't parameterize PRAGMA args). Lowercase letters/underscore only — a fixed vocabulary of
+    Snowball languages ('russian', 'english', …) + 'none'/'porter', never user text."""
+    if not isinstance(name, str) or not _FTS_IDENT.match(name):
+        raise ValueError(f"invalid FTS stemmer/stopwords identifier: {name!r}")
+    return name
+
 
 class Store:
-    def __init__(self, embedder, db_path: str = ":memory:"):
+    def __init__(self, embedder, db_path: str = ":memory:", *,
+                 fts_stemmer: str = "porter", fts_stopwords: str = "english"):
+        # BM25/FTS stemmer + stopwords. DuckDB defaults (porter/english) can't normalize non-English
+        # inflection — a Russian query "Фолиновую кислоту" (accusative) misses a doc "фолиновая кислота"
+        # (nominative). Pass fts_stemmer='russian', fts_stopwords='none' for an RU corpus (Snowball
+        # stemmers: english/russian/german/french/…). Validated (interpolated into the PRAGMA).
+        self.fts_stemmer = _fts_ident(fts_stemmer)
+        self.fts_stopwords = _fts_ident(fts_stopwords)
         self.embedder = embedder
         self.dim = int(embedder.dim)
         self.con = duckdb.connect(db_path)
@@ -96,7 +115,9 @@ class Store:
         if not self._fts:
             return
         try:
-            self.con.execute("PRAGMA create_fts_index('chunks', 'id', 'text', overwrite=1)")
+            self.con.execute(
+                f"PRAGMA create_fts_index('chunks', 'id', 'text', "
+                f"stemmer='{self.fts_stemmer}', stopwords='{self.fts_stopwords}', overwrite=1)")
         except Exception:
             pass
 
@@ -116,8 +137,12 @@ class Store:
             return eq([text])[0]
         return self.embedder.encode([text])[0]
 
-    def semantic_search(self, text: str, top_k: int = 50, threshold: float = 0.4,
+    def semantic_search(self, text: str, top_k: int = 50, threshold: float | None = None,
                         document_ids: list | None = None, query_mode: str = "auto") -> list[dict]:
+        # threshold=None → the ENCODER's own sim_floor (bge 0.4; Nemotron/ReasonIR 0.1). A single global
+        # 0.4 silently discards compressed-sim encoders' vector leg — bge stays byte-identical.
+        if threshold is None:
+            threshold = getattr(self.embedder, "sim_floor", 0.4)
         q = self._encode_query(text, query_mode)
         scope = ""
         params: list = [list(q), float(threshold)]

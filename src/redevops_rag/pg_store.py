@@ -242,9 +242,11 @@ class PgStore:
         return list(vec)
 
     def semantic_search(
-        self, text: str, top_k: int = 50, threshold: float = 0.4,
+        self, text: str, top_k: int = 50, threshold: float | None = None,
         document_ids: list | None = None, query_mode: str = "auto",
     ) -> list[dict]:
+        if threshold is None:   # per-encoder floor (bge 0.4; compressed-sim Nemotron/ReasonIR 0.1)
+            threshold = getattr(self.embedder, "sim_floor", 0.4)
         q = self._encode_query(text, query_mode)
         scope = ""
         params: list = [q, q, float(threshold)]

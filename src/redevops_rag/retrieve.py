@@ -84,7 +84,7 @@ def hybrid_search(
     query: str,
     limit: int = 8,
     pool: int = 50,
-    vector_threshold: float = 0.4,
+    vector_threshold: float | None = None,   # None → the encoder's own sim_floor (bge 0.4, Nemotron 0.1)
     recency_half_life_days: float = 90.0,
     keyword_boost_per_term: float = 0.05,
     keyword_boost_cap: float = 1.5,

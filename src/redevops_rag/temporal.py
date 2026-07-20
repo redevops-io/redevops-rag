@@ -55,6 +55,9 @@ class ReasonIREmbedder:
     """
 
     backend = "reasonir"
+    #: ReasonIR-8B sims are compressed like Nemotron's (4096-d reasoning encoder) — the bge-calibrated
+    #: 0.4 floor discards its dense leg. Keep the top ranks; RRF/rerank order them.
+    sim_floor = 0.1
 
     #: ReasonIR is instruction-tuned (arXiv:2504.20595): queries carry a task instruction,
     #: documents don't. Applied on the query side only, via ``encode_queries``.
