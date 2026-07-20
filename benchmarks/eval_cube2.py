@@ -75,8 +75,10 @@ _ABSTAIN = ("If the pieces needed to answer are present in the context, reason a
 # encoder_for) — nutrition is Russian/domain → Nemotron-Embed; the English sets → cheap bge. A Nemotron
 # store auto-applies the asymmetric query instruction (semantic_search query_mode + DIVER instruct/plain),
 # so no call-site change is needed here. Default OFF → hardcoded bge, byte-identical to prior cube2 runs.
-# Needs the Nemotron endpoint served (REDEVOPS_RAG_NEMOTRON_URL). The 'reasonir' method keeps its own
-# ReasonIR embedder regardless (a fixed English arm, a legitimate cell to measure).
+# REQUIRED with EMBED_ROUTING: export REDEVOPS_RAG_NEMOTRON_URL=http://<host>:8013/v1/embeddings — the
+# NemotronEmbedder defaults to 127.0.0.1:8013, so off-box it ConnectionRefuses and silently drops every
+# nutrition-*retrieved* cell (oracle is unaffected → looks like a retrieval collapse, not a config bug).
+# The 'reasonir' method keeps its own ReasonIR embedder regardless (a fixed English arm, still a valid cell).
 EMBED_ROUTING = os.environ.get("EMBED_ROUTING", "").lower() in ("1", "true", "yes", "on")
 DATASET_CORPUS = {"nutrition": ("ru", "nutrition")}   # dataset -> (lang, domain); default ('en','')
 
