@@ -17,7 +17,7 @@ Musique fix (d): retrieval K raised + union of sub-query hits so BOTH bridge hop
   MODELS=qwen METHODS=bm25,hybrid,reasonir,diver,cr-auto CONDS=closed,oracle,retrieved \
   DATASETS=popqa,musique,longmemeval,tempo N=12 <venv>/bin/python benchmarks/eval_cube2.py
 """
-import sys, os, json, hashlib, statistics as st
+import sys, os, json, time, hashlib, statistics as st
 sys.path.insert(0, "/mnt/backup/projects/context-runtime-bench")
 from openai import OpenAI
 from redevops_rag.store import Store
@@ -162,6 +162,52 @@ if "api" in clients and "grok" in (MODEL_CFG["api"]["model"] or "").lower():
           "circularity. Use a DIFFERENT frontier model as the answerer, or read the result with that "
           "caveat.", flush=True)
 
+# ---- Judge-liveness guard --------------------------------------------------------------------------
+# The failure this defends against: judge()/_rubric_correct() previously did `except Exception: return
+# False`, so a DEAD judge (grok/x.ai outage, expired key, rate-limit wall) threw on every call and
+# silently scored every answer INCORRECT — indistinguishable from a genuinely wrong answer. That
+# corrupted the nutrition re-chunk A/B (baseline read 0.458 instead of 0.75, mis-attributed to
+# "settings"). A dead judge must FAIL LOUD, not deflate accuracy to zero. Two layers:
+#   (1) preflight — before any cell runs, probe a known-CORRECT and known-WRONG pair; abort if the
+#       judge is unreachable or misgrades.
+#   (2) in-run — a judge API failure raises JudgeUnavailable (a distinct signal from an INCORRECT
+#       verdict); transient blips get bounded retries, and a sustained streak aborts the run so no
+#       judge-blind cells reach the results dir.
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "grok-4.5")
+JUDGE_MAX_FAILS = int(os.environ.get("JUDGE_MAX_FAILS", "3"))   # consecutive hard failures → abort loud
+JUDGE_RETRIES = int(os.environ.get("JUDGE_RETRIES", "3"))       # per-call retries for transient blips
+_JUDGE = {"calls": 0, "fails": 0, "consecutive": 0}
+
+
+class JudgeUnavailable(RuntimeError):
+    """The judge API call failed (outage / auth / rate-limit) — NOT a legitimate INCORRECT verdict."""
+
+
+def _judge_raw(messages, max_tokens):
+    """One judge completion. Retries transient blips, then — on a sustained failure — raises
+    JudgeUnavailable (so callers never mistake an outage for a wrong answer) and aborts the whole run
+    once JUDGE_MAX_FAILS consecutive judged items have failed (the judge is down; everything past this
+    point would be garbage)."""
+    _JUDGE["calls"] += 1
+    last = None
+    for attempt in range(max(1, JUDGE_RETRIES)):
+        try:
+            r = judge_cli.chat.completions.create(model=JUDGE_MODEL, temperature=0,
+                                                  max_tokens=max_tokens, messages=messages)
+            _JUDGE["consecutive"] = 0
+            return r.choices[0].message.content or ""
+        except Exception as e:  # noqa: BLE001 — transport/API error: retry, then escalate
+            last = e
+            if attempt + 1 < max(1, JUDGE_RETRIES):
+                time.sleep(1.5 * (attempt + 1))
+    _JUDGE["fails"] += 1
+    _JUDGE["consecutive"] += 1
+    if _JUDGE["consecutive"] >= JUDGE_MAX_FAILS:
+        sys.exit(f"FATAL: judge ({JUDGE_MODEL}) unreachable for {_JUDGE['consecutive']} consecutive "
+                 f"judged items ({_JUDGE['fails']} total) — aborting so a dead judge cannot silently "
+                 f"score every answer INCORRECT. Last error: {type(last).__name__}: {str(last)[:180]}")
+    raise JudgeUnavailable(str(last))
+
 def reason_llm(system, user):
     r = QWEN.chat.completions.create(model="Qwen3.6-35B-A3B", temperature=0, max_tokens=120,
         extra_body=NOTHINK, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
@@ -228,33 +274,54 @@ RUBRIC_DATASETS = set(x for x in os.environ.get("RUBRIC_DATASETS", "").split(","
 RUBRIC_MIN = float(os.environ.get("RUBRIC_MIN", "0.6"))
 
 def _rubric_correct(question, golds, cand):
-    try:
-        r = judge_cli.chat.completions.create(model="grok-4.5", temperature=0, max_tokens=6,
-            messages=[{"role": "system", "content": "You grade a long-form answer against a rubric. GOLD lists "
-                       "the key point(s) a correct answer must convey (phrasing/language/units may differ; the "
-                       "answer may add detail). Reply ONLY a number 0..1 = the share of GOLD key points the "
-                       "MODEL answer correctly covers."},
-                      {"role": "user", "content": f"Q: {question}\nGOLD key points: {' ; '.join(golds)}\nMODEL: {cand}\nScore:"}])
-        import re as _re
-        m = _re.search(r"[01](?:\.\d+)?", (r.choices[0].message.content or ""))
-        return (float(m.group()) if m else 0.0) >= RUBRIC_MIN
-    except Exception:
-        return False
+    # A JudgeUnavailable here propagates: an outage must not read as "rubric score 0" (that's the very
+    # silent-zeroing this guard exists to stop). The _judge_raw streak guard aborts loud on a real outage.
+    out = _judge_raw(
+        [{"role": "system", "content": "You grade a long-form answer against a rubric. GOLD lists "
+          "the key point(s) a correct answer must convey (phrasing/language/units may differ; the "
+          "answer may add detail). Reply ONLY a number 0..1 = the share of GOLD key points the "
+          "MODEL answer correctly covers."},
+         {"role": "user", "content": f"Q: {question}\nGOLD key points: {' ; '.join(golds)}\nMODEL: {cand}\nScore:"}],
+        max_tokens=6)
+    import re as _re
+    m = _re.search(r"[01](?:\.\d+)?", out)
+    return (float(m.group()) if m else 0.0) >= RUBRIC_MIN
 
 def judge(question, golds, cand, *, dataset=""):
     if not cand or cand.strip().upper() == "NOT FOUND": return False
     golds = [str(g) for g in golds if g is not None and str(g).strip()]
-    if any(g.lower() in cand.lower() for g in golds): return True
-    if dataset in RUBRIC_DATASETS:
-        return _rubric_correct(question, golds, cand)
+    if any(g.lower() in cand.lower() for g in golds): return True   # substring hit — judge-independent
     try:
-        r = judge_cli.chat.completions.create(model="grok-4.5", temperature=0, max_tokens=8,
-            messages=[{"role": "system", "content": "Strict QA grader. Reply exactly CORRECT or INCORRECT: is the "
-                       "MODEL answer correct given any GOLD variant (phrasing/language may differ)?"},
-                      {"role": "user", "content": f"Q: {question}\nGOLD: {' / '.join(golds)}\nMODEL: {cand}\nVerdict:"}])
-        v = (r.choices[0].message.content or "").strip().upper()
+        if dataset in RUBRIC_DATASETS:
+            return _rubric_correct(question, golds, cand)
+        v = _judge_raw(
+            [{"role": "system", "content": "Strict QA grader. Reply exactly CORRECT or INCORRECT: is the "
+              "MODEL answer correct given any GOLD variant (phrasing/language may differ)?"},
+             {"role": "user", "content": f"Q: {question}\nGOLD: {' / '.join(golds)}\nMODEL: {cand}\nVerdict:"}],
+            max_tokens=8).strip().upper()
         return "CORRECT" in v and "INCORRECT" not in v
-    except Exception: return False
+    except JudgeUnavailable:
+        # A tolerated single blip (bounded retries already exhausted; the streak guard aborts on a real
+        # outage). Score conservatively False for this one item; the end-of-run report surfaces the count.
+        return False
+
+def _judge_preflight():
+    """Fail LOUD before the run if the judge is dead or misgrading — otherwise the tolerated-blip path
+    would let a sustained outage deflate accuracy silently. Probes the LLM-judge path directly (gold
+    that does NOT substring-match the answer, so the grok call is actually exercised): a paraphrase that
+    should grade CORRECT and a wrong city that should grade INCORRECT. Both must land, or we abort."""
+    f0 = _JUDGE["fails"]
+    pos = judge("What is the capital of France?", ["Paris"], "The capital city of France.")
+    neg = judge("What is the capital of France?", ["Paris"], "Berlin, the German capital.")
+    if _JUDGE["fails"] > f0:
+        sys.exit(f"FATAL: judge ({JUDGE_MODEL}) unreachable during preflight — aborting before any cell "
+                 f"runs so a dead judge can't score every answer INCORRECT. Check XAI_API_KEY / JUDGE_MODEL "
+                 f"and the x.ai endpoint, then re-run.")
+    if not (pos and not neg):
+        sys.exit(f"FATAL: judge ({JUDGE_MODEL}) preflight sanity FAILED (correct-probe={pos}, expected True; "
+                 f"wrong-probe={neg}, expected False) — the judge is misgrading; aborting rather than emit "
+                 f"corrupt accuracy.")
+    print(f"[judge] preflight OK ({JUDGE_MODEL}): correct-probe pass, wrong-probe pass", flush=True)
 
 def ctx_of(texts, budget):
     out, cap, used = [], budget * 4, 0
@@ -368,6 +435,7 @@ def load(name):
     return [r for r in rows if str(r.get("answer", "")).strip()][:N]
 
 print(f"models={MODELS} methods={METHODS} conds={CONDS} datasets={DATASETS} N={N} K={K}", flush=True)
+_judge_preflight()   # abort loud on a dead/misgrading judge BEFORE any cell is written
 for name in DATASETS:
     items = load(name)
     CURRENT_DATASET = name                # competence-routed cr-auto reads this for the by_dataset ceiling
@@ -403,4 +471,8 @@ for name in DATASETS:
 if _TRUNC["total"]:
     print(f"truncation: {_TRUNC['n']}/{_TRUNC['total']} completions hit max_tokens "
           f"({100*_TRUNC['n']/_TRUNC['total']:.1f}%) — raise THINK_BUDGET if high (lost final answers)", flush=True)
+if _JUDGE["fails"]:
+    print(f"judge: {_JUDGE['fails']}/{_JUDGE['calls']} judge call(s) failed after retries "
+          f"({100*_JUDGE['fails']/max(1,_JUDGE['calls']):.1f}%) — those items were scored INCORRECT on a "
+          f"tolerated blip; re-run if non-trivial (accuracy is a floor, not the true value)", flush=True)
 print("CUBE2_DONE", flush=True)

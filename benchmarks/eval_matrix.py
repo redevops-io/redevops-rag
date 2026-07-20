@@ -18,8 +18,18 @@ Methods (select via METHODS env; each runs in the venv that has its deps):
   simgraph  dependency-free 2-hop term-spreading graph          (cheap graph)
   hipporag  real HippoRAG LLM-OpenIE entity graph + PPR         (heavy graph)
   graphiti  real Graphiti bi-temporal KG over Neo4j             (heavy temporal)
+  cr-auto   competence-routed: per item picks the cube-best retriever, measures ITS recall
 
   METHODS=hybrid,diver,simgraph DATASETS=popqa,musique,longmemeval N=15 POLLUTE=15 \
+    <venv>/bin/python benchmarks/eval_matrix.py
+
+cr-auto (closes I6 — the routed-recall row the retrieval page is missing): routes each question to the
+competence-best retriever from CR_ROUTES (build_routes.py's routes.json — the SAME routing eval_cube2's
+cr_route uses), then reports that retriever's recall@k. by_dataset[name] takes precedence (deterministic
+per regime); else by_rep[classify(question)] routes per question via the Qwen intent classifier. This is
+the recall-side proof that routing selects the right retriever per regime — reasonir on nutrition,
+diver on temporal — rather than one method applied everywhere.
+  METHODS=cr-auto CR_ROUTES=/path/routes.json DATASETS=nutrition,musique,longmemeval,tempo \
     <venv>/bin/python benchmarks/eval_matrix.py
 """
 import sys, os, json, math, hashlib, datetime as dt, statistics as st
@@ -136,6 +146,36 @@ def make_engine(method):
             except Exception: pass
             return ids
         return run
+    if method == "cr-auto":
+        # Competence-routed recall: per item, resolve the cube-best retriever (same precedence as
+        # eval_cube2.cr_route — by_dataset ceiling, else by_rep runtime route) and return ITS ranking.
+        # Sub-engines are built lazily so we only pay for the retrievers the routes actually name.
+        routes = {}
+        rp = os.environ.get("CR_ROUTES")
+        if rp:
+            try: routes = json.load(open(rp))
+            except Exception: routes = {}   # a bad routes file falls back to CR_DEFAULT_METHOD, never crashes
+        by_dataset, by_rep = routes.get("by_dataset", {}), routes.get("by_rep", {})
+        default_method = os.environ.get("CR_DEFAULT_METHOD", "hybrid")
+        _engines, _router = {}, {"m": None}
+        def _classify(q):
+            if _router["m"] is None:
+                from context_runtime.planner.llm_intent import OpenAICompatModel
+                _router["m"] = OpenAICompatModel(QWEN, "Qwen3.6-35B-A3B")
+            return _router["m"].classify(q) or "document"
+        def _engine_for(m):
+            if m == "cr-auto": m = default_method   # guard against a self-referential route entry
+            if m not in _engines:
+                _engines[m] = make_engine(m)
+            return _engines[m]
+        def _route_method(item):
+            r = by_dataset.get(item.get("_dataset"))
+            if not r and by_rep:
+                r = by_rep.get(_classify(item["question"]))
+            return (r or {}).get("method", default_method)
+        def run(item, docs):
+            return _engine_for(_route_method(item))(item, docs)
+        return run
     raise ValueError(method)
 
 # ---------- run ----------
@@ -149,6 +189,7 @@ for method in METHODS:
     for name in DATASETS:
         rec, nd, n_ok = [], [], 0
         for it in data[name]:
+            it["_dataset"] = name   # cr-auto reads this to resolve the by_dataset route
             try:
                 ids = run(it, corpus_for(it, pools[name]))
                 rec.append(recall_at_k(ids, it["gold"], K)); nd.append(ndcg_at_k(ids, it["gold"], K)); n_ok += 1
