@@ -71,6 +71,22 @@ def ndcg_at_k(ranked_ids, gold, k):
 
 # ---------- engine factories (built once, reused across questions) ----------
 def make_engine(method):
+    if method == "bm25":
+        # lexical baseline — the page's "vs BM25" reference point, on the current (rebuilt) datasets.
+        from redevops_rag.store import Store
+        from redevops_rag.embed import Embedder
+        emb = Embedder()   # embeddings unused by bm25_search, but Store needs an encoder for its schema
+        def run(item, docs):
+            dbp = f"/tmp/mx_bm25_{item['qid']}.duckdb"
+            if os.path.exists(dbp): os.remove(dbp)
+            s = Store(emb, dbp)
+            ch = [{"document_id": d["chunk_id"], "text": d["text"], "metadata": {}} for d in docs]
+            for c in ch: c["embedding"] = [0.0] * emb.dim   # placeholder; bm25 leg ignores vectors
+            s.add_chunks(ch, reindex=True)
+            hits = s.bm25_search(item["question"], limit=K)
+            s.close()
+            return [h["document_id"] for h in hits]
+        return run
     if method in ("hybrid", "reasonir", "diver"):
         from redevops_rag.store import Store
         from redevops_rag.embed import Embedder
@@ -116,13 +132,36 @@ def make_engine(method):
             return [text2id.get(h.text, "?") for h in hr.search(item["question"], k=K)]
         return run
     if method == "graphiti":
-        # Graphiti's OpenAIGenericClient hardcodes max_tokens=16384 in its __init__ (ignoring
-        # config), which alone overflows Qwen's 32k context. Cap the client (extraction JSON is short).
+        # Graphiti's OpenAIGenericClient hardcodes max_tokens=16384 (ignoring config) which alone
+        # overflows Qwen's 32k window; and on dense multi-session corpora the extraction context
+        # (episode + previous_episodes + node list) can spike far past 32k — a ~163k-token prompt on
+        # LongMemEval — 400-ing the entire ingest. FORK the client to (a) cap output and (b) enforce a
+        # hard INPUT-char budget: truncate variable-size USER content to fit the window before the API
+        # call, never the SYSTEM instructions. Source-agnostic — whatever field balloons, the prompt
+        # still fits, so Graphiti ingests arbitrarily large/dense corpora and degrades gracefully
+        # (a truncated extraction) instead of crashing. GRAPHITI_MAX_INPUT_CHARS tunes the budget.
         import graphiti_core.llm_client.openai_generic_client as _ogc
         _OC = _ogc.OpenAIGenericClient
-        class _CappedClient(_OC):
+        _MAX_IN = int(os.environ.get("GRAPHITI_MAX_INPUT_CHARS", "100000"))   # ~25k tok, < 32k window
+        class _BoundedClient(_OC):
             def __init__(self, *a, **k): k.setdefault("max_tokens", 2048); super().__init__(*a, **k)
-        _ogc.OpenAIGenericClient = _CappedClient
+            async def _generate_response(self, messages, *a, **k):
+                if sum(len(m.content or "") for m in messages) > _MAX_IN:
+                    sys_c = sum(len(m.content or "") for m in messages if m.role == "system")
+                    budget, used = max(4000, _MAX_IN - sys_c), 0
+                    for m in messages:               # keep system instructions whole; bound user content
+                        if m.role == "system":
+                            continue
+                        c = m.content or ""
+                        if used >= budget:
+                            m.content = ""
+                        elif used + len(c) > budget:
+                            m.content = c[: budget - used] + "\n…[truncated to fit context window]"
+                            used = budget
+                        else:
+                            used += len(c)
+                return await super()._generate_response(messages, *a, **k)
+        _ogc.OpenAIGenericClient = _BoundedClient
         from context_runtime.adapters.store_temporal import GraphitiTemporalRetriever
         def parse_dt(s):
             for fmt in ("%Y/%m/%d (%a) %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
