@@ -12,7 +12,7 @@ carved out of its multi-tenant SaaS shell (no Auth0/Stripe/Kubernetes/workspace 
 you can drop the *same* retrieval over any folder — a docs tree, a repo, an Obsidian vault —
 in three lines.
 
-> **Versioning — backwards-compatible across v1 · v2 · v3 · v4 · v5.** The library API, CLI, and on-disk index/store format from every prior version keep working — upgrade in place, no migration.
+> **Versioning — backwards-compatible across all five index/format generations (v1–v5).** (These `vN` are *architecture generations*, not release versions — releases are semver, e.g. `v0.2.0`.) The library API, CLI, and on-disk index/store format from every prior generation keep working — upgrade in place, no migration.
 
 ## Pipeline
 
