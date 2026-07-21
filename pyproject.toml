@@ -1,6 +1,6 @@
 [project]
 name = "redevops-rag"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Hybrid RAG (DuckDB vector + BM25 + RRF + recency/keyword priors + optional cross-encoder rerank) as an installable library + CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,11 @@ redevops-rag = "redevops_rag.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Single source of truth for the version: read __version__ from the package, so pyproject and
+# redevops_rag.__version__ can never drift (they previously disagreed: 0.1.0 vs 0.2.0).
+[tool.hatch.version]
+path = "src/redevops_rag/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/redevops_rag"]
