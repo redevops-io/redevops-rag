@@ -1,5 +1,9 @@
 # redevops-rag
 
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB.svg) [![NVIDIA Inception](https://img.shields.io/badge/NVIDIA-Inception%20Program%20Member-76B900.svg)](https://www.nvidia.com/en-us/startups/)
+
+> **🚀 NVIDIA Inception Program Member** — ReDevOps is a member of the NVIDIA Inception Program, supporting startups advancing AI and accelerated computing. Membership provides access to NVIDIA technology, technical resources, and the startup ecosystem. It does not imply product endorsement by NVIDIA.
+
 Hybrid RAG as a small, installable library + CLI — **DuckDB vector + BM25 fused via
 Reciprocal Rank Fusion, recency & keyword priors, and an optional cross-encoder rerank.**
 
@@ -8,13 +12,13 @@ carved out of its multi-tenant SaaS shell (no Auth0/Stripe/Kubernetes/workspace 
 you can drop the *same* retrieval over any folder — a docs tree, a repo, an Obsidian vault —
 in three lines.
 
-> **Versioning — backwards-compatible across v1 · v2 · v3 · v4.** The library API, CLI, and on-disk index/store format from every prior version keep working — upgrade in place, no migration.
+> **Versioning — backwards-compatible across v1 · v2 · v3 · v4 · v5.** The library API, CLI, and on-disk index/store format from every prior version keep working — upgrade in place, no migration.
 
 ## Pipeline
 
 ```
 query
-  ├─ dense   : sentence-transformers embedding → DuckDB array_cosine_similarity (threshold 0.4)
+  ├─ dense   : embedding → DuckDB array_cosine_similarity (threshold = the encoder's sim_floor; bge 0.4, Nemotron/ReasonIR 0.1)
   └─ sparse  : DuckDB FTS BM25
         └─ Reciprocal Rank Fusion   score = Σ 1 / (k + rank),  k = 60
               └─ recency prior       0.5 ** (age_days / 90)
@@ -77,7 +81,9 @@ small — those belong in **git**, not in a RAG.
 | `REDEVOPS_RAG_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | cross-encoder for `--rerank` |
 | `REDEVOPS_RAG_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | — | OpenAI-compatible endpoint for `ask` |
 
-> Status: **v0.1, not yet large-corpus benchmarked.** The retrieval logic is a faithful port
-> of the production pipeline; the packaging/CLI are new. Validate on your own data.
+> Status: **runnable, benchmarked library.** The retrieval logic is a faithful port of the
+> production pipeline; the packaging/CLI are new. The `benchmarks/` suite evaluates recall/NDCG
+> across PopQA · MuSiQue · LongMemEval · TEMPO · Nutrition (bge / ReasonIR / Nemotron-3-Embed
+> encoders, hybrid / DIVER / graph methods). Validate on your own data.
 
 AGPL-3.0-or-later · redevops.io
