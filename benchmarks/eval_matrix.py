@@ -143,9 +143,14 @@ def make_engine(method):
         import graphiti_core.llm_client.openai_generic_client as _ogc
         _OC = _ogc.OpenAIGenericClient
         _MAX_IN = int(os.environ.get("GRAPHITI_MAX_INPUT_CHARS", "100000"))   # ~25k tok, < 32k window
+        _MAX_OUT = int(os.environ.get("GRAPHITI_MAX_OUTPUT_TOKENS", "2048"))  # extraction JSON is short
         class _BoundedClient(_OC):
-            def __init__(self, *a, **k): k.setdefault("max_tokens", 2048); super().__init__(*a, **k)
-            async def _generate_response(self, messages, *a, **k):
+            def __init__(self, *a, **k): k.setdefault("max_tokens", _MAX_OUT); super().__init__(*a, **k)
+            async def _generate_response(self, messages, response_model=None, max_tokens=None, *a, **k):
+                # Cap OUTPUT here too: Graphiti passes max_tokens=16384 per-call, overriding __init__ —
+                # 16384 output alone half-fills the 32k window, so on a large-input call (LongMemEval)
+                # input+output overflows even when input is within budget. Hold output small.
+                max_tokens = min(max_tokens or _MAX_OUT, _MAX_OUT)
                 if sum(len(m.content or "") for m in messages) > _MAX_IN:
                     sys_c = sum(len(m.content or "") for m in messages if m.role == "system")
                     budget, used = max(4000, _MAX_IN - sys_c), 0
@@ -160,7 +165,7 @@ def make_engine(method):
                             used = budget
                         else:
                             used += len(c)
-                return await super()._generate_response(messages, *a, **k)
+                return await super()._generate_response(messages, response_model, max_tokens, *a, **k)
         _ogc.OpenAIGenericClient = _BoundedClient
         from context_runtime.adapters.store_temporal import GraphitiTemporalRetriever
         def parse_dt(s):
