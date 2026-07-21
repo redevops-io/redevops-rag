@@ -142,19 +142,23 @@ def make_engine(method):
         # (a truncated extraction) instead of crashing. GRAPHITI_MAX_INPUT_CHARS tunes the budget.
         import graphiti_core.llm_client.openai_generic_client as _ogc
         _OC = _ogc.OpenAIGenericClient
-        _MAX_IN = int(os.environ.get("GRAPHITI_MAX_INPUT_CHARS", "100000"))   # ~25k tok, < 32k window
-        _MAX_OUT = int(os.environ.get("GRAPHITI_MAX_OUTPUT_TOKENS", "2048"))  # extraction JSON is short
+        # Both sides of the window must be bounded TOGETHER: input + output < WINDOW. Two failure modes
+        # to avoid — (a) a huge extraction context 400-overflows the input (LongMemEval's dense sessions),
+        # (b) too small an output budget TRUNCATES the edge-extraction JSON mid-object → JSONDecodeError
+        # (many entities/edges need >2k output tokens). Fix: bound input to leave room for a generous
+        # output, then size output DYNAMICALLY to whatever room remains — big enough for the JSON, never
+        # overflowing. tempo succeeded at n=15 already; this is for the edge-heavy long-memory sessions.
+        _WINDOW = int(os.environ.get("GRAPHITI_CTX_WINDOW", "32768"))
+        _OUT_CAP = int(os.environ.get("GRAPHITI_MAX_OUTPUT_TOKENS", "6144"))   # headroom for edge JSON
+        _MARGIN = 512
+        _MAX_IN = (_WINDOW - _OUT_CAP - _MARGIN) * 4    # input char budget that preserves output room
         class _BoundedClient(_OC):
-            def __init__(self, *a, **k): k.setdefault("max_tokens", _MAX_OUT); super().__init__(*a, **k)
+            def __init__(self, *a, **k): k.setdefault("max_tokens", _OUT_CAP); super().__init__(*a, **k)
             async def _generate_response(self, messages, response_model=None, max_tokens=None, *a, **k):
-                # Cap OUTPUT here too: Graphiti passes max_tokens=16384 per-call, overriding __init__ —
-                # 16384 output alone half-fills the 32k window, so on a large-input call (LongMemEval)
-                # input+output overflows even when input is within budget. Hold output small.
-                max_tokens = min(max_tokens or _MAX_OUT, _MAX_OUT)
-                if sum(len(m.content or "") for m in messages) > _MAX_IN:
+                if sum(len(m.content or "") for m in messages) > _MAX_IN:   # bound USER content, keep SYSTEM
                     sys_c = sum(len(m.content or "") for m in messages if m.role == "system")
                     budget, used = max(4000, _MAX_IN - sys_c), 0
-                    for m in messages:               # keep system instructions whole; bound user content
+                    for m in messages:
                         if m.role == "system":
                             continue
                         c = m.content or ""
@@ -165,7 +169,9 @@ def make_engine(method):
                             used = budget
                         else:
                             used += len(c)
-                return await super()._generate_response(messages, response_model, max_tokens, *a, **k)
+                in_tok = sum(len(m.content or "") for m in messages) // 4   # size output to the room left
+                out = max(1024, min(_OUT_CAP, _WINDOW - in_tok - _MARGIN))
+                return await super()._generate_response(messages, response_model, out, *a, **k)
         _ogc.OpenAIGenericClient = _BoundedClient
         from context_runtime.adapters.store_temporal import GraphitiTemporalRetriever
         def parse_dt(s):
