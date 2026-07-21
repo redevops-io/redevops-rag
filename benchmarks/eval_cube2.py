@@ -311,8 +311,12 @@ def _judge_preflight():
     that does NOT substring-match the answer, so the grok call is actually exercised): a paraphrase that
     should grade CORRECT and a wrong city that should grade INCORRECT. Both must land, or we abort."""
     f0 = _JUDGE["fails"]
-    pos = judge("What is the capital of France?", ["Paris"], "The capital city of France.")
-    neg = judge("What is the capital of France?", ["Paris"], "Berlin, the German capital.")
+    # Non-substring probes (so the grok path is actually exercised) that are UNAMBIGUOUS — a strict grader
+    # must accept the paraphrase and reject the wrong number. (The old "capital of France"→"The capital
+    # city of France." probe was borderline: it restates the question without naming Paris, so a strict
+    # grok correctly graded it INCORRECT and the preflight false-aborted.)
+    pos = judge("How many continents are there?", ["7"], "There are seven continents.")
+    neg = judge("How many continents are there?", ["7"], "There are five continents.")
     if _JUDGE["fails"] > f0:
         sys.exit(f"FATAL: judge ({JUDGE_MODEL}) unreachable during preflight — aborting before any cell "
                  f"runs so a dead judge can't score every answer INCORRECT. Check XAI_API_KEY / JUDGE_MODEL "
