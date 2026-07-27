@@ -1,0 +1,482 @@
+"""Answer cube v2 — datasets x methods x models, with per-cell CONDITIONS that expose the
+bottleneck (a+b), Graphiti as a retrieval method, the musique both-hop fix (d), a 7-model
+registry, and a bottleneck-aware CR router (c).
+
+Per (dataset, method, model) we record accuracy under conditions:
+  closed    — NO context (parametric-memory / contamination baseline)          [a]
+  oracle    — ONLY the gold docs (is the ceiling model-bound or retrieval-bound?) [b]
+  retrieved — the method's real retrieval
+
+Reading a cell:  oracle >> retrieved -> RETRIEVAL-bound (better retriever helps)
+                 oracle ~= closed (both low) -> MODEL-bound (better model / decompose helps)
+                 closed high -> contamination (subtract it out)
+
+Methods: bm25, hybrid, reasonir, diver, graphiti, cr-auto(bottleneck-aware).
+Musique fix (d): retrieval K raised + union of sub-query hits so BOTH bridge hops are covered.
+
+  MODELS=qwen METHODS=bm25,hybrid,reasonir,diver,cr-auto CONDS=closed,oracle,retrieved \
+  DATASETS=popqa,musique,longmemeval,tempo N=12 <venv>/bin/python benchmarks/eval_cube2.py
+"""
+import sys, os, json, time, hashlib, statistics as st
+sys.path.insert(0, "/mnt/backup/projects/context-runtime-bench")
+from openai import OpenAI
+from redevops_rag.store import Store
+from redevops_rag.embed import Embedder
+from redevops_rag.temporal import ReasonIREmbedder
+from redevops_rag.retrieve import hybrid_search, diver_search
+from context_runtime.planner.llm_intent import OpenAICompatModel
+
+DATADIR = os.environ.get("DATADIR", "/tmp/claude-1000/-mnt-backup-projects-ffmpeg-mcp-aws/4b091f87-0b28-4473-a19e-4caba574b251/scratchpad/datasets")
+RES = os.environ.get("OUT", "/tmp/claude-1000/-mnt-backup-projects-ffmpeg-mcp-aws/4b091f87-0b28-4473-a19e-4caba574b251/scratchpad/cube2_res")
+DATASETS = os.environ.get("DATASETS", "popqa,musique,longmemeval,tempo").split(",")
+METHODS = os.environ.get("METHODS", "bm25,hybrid,reasonir,diver,cr-auto").split(",")
+MODELS = os.environ.get("MODELS", "qwen").split(",")
+CONDS = os.environ.get("CONDS", "closed,oracle,retrieved").split(",")
+N = int(os.environ.get("N", "12"))
+K = int(os.environ.get("K", "8"))          # raised from 6 (d): more room for both multi-hop bridges
+BUDGET = int(os.environ.get("BUDGET", "3000"))
+# Context-budget fix (Run-2 audit): the longmemeval "ceiling" was ctx_of TRUNCATING gold — gold contexts
+# are 22k–75k chars but BUDGET=3000 caps oracle at 12k, so models were graded on sessions they never saw.
+# Fixing it lifted qwen-35B oracle 0.083→0.333 for free (and Kimi→0.75). ORACLE shows FULL gold; long
+# multi-session datasets get a larger retrieved budget too. (tempo is a broken dataset — essay gold — see
+# the audit; rebuild or drop, not a budget issue.)
+ORACLE_BUDGET = int(os.environ.get("ORACLE_BUDGET", "24000"))    # ~96k chars — covers the largest gold
+DATASET_BUDGET = {"longmemeval": int(os.environ.get("LONGMEM_BUDGET", "24000"))}
+
+def ctx_budget(dataset, cond):
+    """Oracle = full gold (never truncate the ceiling); retrieved = per-dataset (long inputs get room)."""
+    return ORACLE_BUDGET if cond == "oracle" else DATASET_BUDGET.get(dataset, BUDGET)
+NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}}
+# ---- Phase-0 generation-strategy ablation (the answer-plane axis) --------------------------------
+# STRATEGIES sweeps the generation strategy per cell, isolating GENERATION from retrieval (run with
+# CONDS=oracle to hold retrieval at gold). `direct` reproduces the prior terse/no-think baseline
+# EXACTLY; reason/decompose/mapreduce turn thinking on, widen the budget, and recalibrate abstention.
+#   direct     — terse extractive, no-think, 96 tok            (lookup)
+#   reason     — think + CoT + short final answer              (synthesis / single-hop reasoning)
+#   decompose  — list intermediate facts → answer → compose    (multi_hop)
+#   mapreduce  — extract (date,entity,value) per source → agg  (temporal aggregation / counting)
+# The resulting acc per (dataset, strategy, model) at oracle is the warm-start prior for the CR
+# generation bandit (Phase 1).  e.g.:
+#   CONDS=oracle STRATEGIES=direct,reason,decompose,mapreduce DATASETS=musique,longmemeval \
+#     MODELS=qwen METHODS=hybrid N=12 <venv>/bin/python benchmarks/eval_cube2.py
+STRATEGIES = os.environ.get("STRATEGIES", "direct").split(",")
+GEN_BUDGET = int(os.environ.get("GEN_BUDGET", "768"))       # token budget for reasoning strategies
+# `direct_think` (Run 2): native model reasoning (enable_thinking=True) with a TERSE/direct answer prompt
+# — the model thinks, we do NOT add CoT scaffolding (that was the refuted, unstable `reason` strategy).
+# Isolates model reasoning from prompt strategy. Needs a generous budget so the <think> trace + final
+# answer fit; a trace that hits max_tokens loses its final line (tracked as truncation).
+THINK_BUDGET = int(os.environ.get("THINK_BUDGET", "4096"))
+# Recalibrated abstention (Step 4): don't bail when the pieces are present — the cure for over-abstention.
+_ABSTAIN = ("If the pieces needed to answer are present in the context, reason across them and answer; "
+            "reply exactly NOT FOUND only if the context truly lacks the answer.")
+
+# ---- (A) y-axis: best EMBEDDER per dataset (opt-in EMBED_ROUTING=1) --------------------------------
+# "model coupled with best embedder for the dataset": route the encoder on the corpus (redevops-rag
+# encoder_for) — nutrition is Russian/domain → Nemotron-Embed; the English sets → cheap bge. A Nemotron
+# store auto-applies the asymmetric query instruction (semantic_search query_mode + DIVER instruct/plain),
+# so no call-site change is needed here. Default OFF → hardcoded bge, byte-identical to prior cube2 runs.
+# REQUIRED with EMBED_ROUTING: export REDEVOPS_RAG_NEMOTRON_URL=http://<host>:8013/v1/embeddings — the
+# NemotronEmbedder defaults to 127.0.0.1:8013, so off-box it ConnectionRefuses and silently drops every
+# nutrition-*retrieved* cell (oracle is unaffected → looks like a retrieval collapse, not a config bug).
+# The 'reasonir' method keeps its own ReasonIR embedder regardless (a fixed English arm, still a valid cell).
+EMBED_ROUTING = os.environ.get("EMBED_ROUTING", "").lower() in ("1", "true", "yes", "on")
+DATASET_CORPUS = {"nutrition": ("ru", "nutrition")}   # dataset -> (lang, domain); default ('en','')
+
+# ---- (B) z-axis: couple CR-auto retrieval mode with proper INFERENCE (opt-in CR_COUPLE=1) ----------
+# cr-auto already picks retriever+model per regime; coupling also picks the reasoning strategy per
+# regime (temporal→mapreduce aggregation, multi-hop→decompose, lookup/document→direct). When on, the
+# cr-auto cell ignores the swept STRATEGIES and labels its strategy 'auto'. Default OFF → prior cr-auto.
+CR_COUPLE = os.environ.get("CR_COUPLE", "").lower() in ("1", "true", "yes", "on")
+REGIME_STRATEGY = {"temporal": "mapreduce", "graph": "decompose", "document": "direct", "low_graph": "direct"}
+
+# ---- Competence-routed cr-auto (finding #5): route from the MEASURED cube, not regime rules ----------
+# The v5 cube showed cr-auto's regime→(retriever,strategy) heuristics leaving accuracy on the table on
+# every dataset (nutrition → hybrid 0.75 when reasonir scores 0.917). CR_ROUTES points at the routes.json
+# that build_routes.py emits from cube.csv; per (dataset | rep) it gives the competence-best
+# (method, strategy). Off → the regime heuristics below (prior behavior). This is the Step-2 re-run: turn
+# it on, re-run METHODS=cr-auto, and measure cr-auto vs best-fixed.
+ROUTES = {}
+if os.environ.get("CR_ROUTES"):
+    try:
+        ROUTES = json.load(open(os.environ["CR_ROUTES"]))
+    except Exception:  # noqa: BLE001 — a bad routes file must not break the run; fall back to regime rules
+        ROUTES = {}
+CURRENT_DATASET = ""   # set per dataset in the main loop so cr_route can use the by_dataset ceiling
+os.makedirs(RES, exist_ok=True)
+
+
+def _extra(model, think):
+    """Thinking-capable models were registered with the NOTHINK sentinel; flip enable_thinking per
+    strategy. Models without a thinking switch pass their configured extra through unchanged."""
+    if MODEL_CFG[model].get("extra") == NOTHINK:
+        return {"chat_template_kwargs": {"enable_thinking": bool(think)}}
+    return MODEL_CFG[model].get("extra") or {}
+
+
+def _final(out):
+    """Pull the final answer from a reasoning response: strip <think> blocks, then take the 'Answer:'
+    line if present (the reasoning strategies end with one), else the last non-empty line."""
+    import re
+    out = re.sub(r"<think>.*?</think>", "", out or "", flags=re.S).strip()
+    for line in reversed(out.splitlines()):
+        s = line.strip()
+        if s.lower().startswith("answer:"):
+            return s.split(":", 1)[1].strip()
+    return out.splitlines()[-1].strip() if out.strip() else out
+
+# ---- 7-model registry (4 GPU NVFP4 + 3 CPU GGUF). url=None => not currently served; the
+# serve-and-swap driver fills the port it brings each model up on. tier drives default N. ----
+MODEL_CFG = {
+    "qwen":       {"url": "http://192.168.40.105:30807/v1", "model": "Qwen3.6-35B-A3B",   "extra": NOTHINK, "tier": "gpu", "rank": 2},
+    "qwen35":     {"url": os.environ.get("QWEN35_URL"),     "model": "Qwen3.5-122B",      "extra": NOTHINK,  "tier": "cpu", "rank": 3},
+    "mistral":    {"url": os.environ.get("MISTRAL_URL"),    "model": "mistral-small-24b", "extra": {},       "tier": "gpu", "rank": 1},
+    "gemma":      {"url": os.environ.get("GEMMA_URL"),      "model": "gemma4-26b-a4b",    "extra": NOTHINK,  "tier": "gpu", "rank": 1},
+    "nemotron":   {"url": os.environ.get("NEMOTRON_URL"),   "model": "nemotron3-nano-30b","extra": NOTHINK,  "tier": "gpu", "rank": 2},
+    "coder":      {"url": os.environ.get("CODER_URL"),      "model": "Qwen3.6-Coder-Next","extra": NOTHINK,  "tier": "cpu", "rank": 3},
+    "nemosuper":  {"url": os.environ.get("NEMOSUPER_URL"),  "model": "Nemotron-3-Super",  "extra": NOTHINK,  "tier": "cpu", "rank": 4},
+    "deepseek":   {"url": "http://192.168.40.105:8001/v1",  "model": "DeepSeek-V4-Flash", "extra": {},       "tier": "cpu", "rank": 5},
+    # Generic API answerer — the infra-free CAPACITY PROBE (Run 2). Point it at any OpenAI-compatible
+    # frontier reasoning endpoint to answer "is the longmemeval/tempo ceiling capacity-bound (a bigger
+    # model breaks it) or task/eval-bound (it won't)?" without the 122B local-infra blocker. Configure
+    # entirely by env: ANSWERER_URL / ANSWERER_MODEL / ANSWERER_KEY. Frontier reasoners think natively,
+    # so run it with STRATEGIES=direct (terse prompt; no enable_thinking toggle needed).
+    # Defaults target Kimi (Moonshot) — a frontier reasoner ≠ the grok judge. Override with ANSWERER_*.
+    # kimi-k2.6 reasons natively + returns EMPTY without a GENEROUS budget (reasoning eats the tokens) and
+    # needs a temperature it accepts (its serve config uses 1, not 0) — both handled in _gen.
+    "api":        {"url": os.environ.get("ANSWERER_URL") or os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1"),
+                   "model": os.environ.get("ANSWERER_MODEL") or os.environ.get("KIMI_MODEL", "kimi-k2.6"),
+                   "extra": {}, "tier": "api", "rank": 9,
+                   "api_key_env": "ANSWERER_KEY" if os.environ.get("ANSWERER_KEY") else "KIMI_API_KEY",
+                   "temperature": float(os.environ.get("ANSWERER_TEMP", "0.6"))},
+}
+STRONGEST = "deepseek"   # for CR-auto model escalation on model-bound queries
+QWEN = OpenAI(base_url="http://192.168.40.105:30807/v1", api_key="EMPTY")
+judge_cli = OpenAI(base_url="https://api.x.ai/v1", api_key=os.environ["XAI_API_KEY"])
+router = OpenAICompatModel("http://192.168.40.105:30807/v1", "Qwen3.6-35B-A3B")
+# api_key per model: an API answerer reads its key from api_key_env; local vLLM stays "EMPTY".
+clients = {m: OpenAI(base_url=MODEL_CFG[m]["url"],
+                     api_key=(os.environ.get(MODEL_CFG[m].get("api_key_env", ""), "") or "EMPTY"), timeout=900)
+           for m in MODELS if MODEL_CFG[m]["url"]}
+if "api" in clients and "grok" in (MODEL_CFG["api"]["model"] or "").lower():
+    print("WARNING: the API answerer is grok — same family as the judge (grok-4.5) → self-grading "
+          "circularity. Use a DIFFERENT frontier model as the answerer, or read the result with that "
+          "caveat.", flush=True)
+
+# ---- Judge-liveness guard --------------------------------------------------------------------------
+# The failure this defends against: judge()/_rubric_correct() previously did `except Exception: return
+# False`, so a DEAD judge (grok/x.ai outage, expired key, rate-limit wall) threw on every call and
+# silently scored every answer INCORRECT — indistinguishable from a genuinely wrong answer. That
+# corrupted the nutrition re-chunk A/B (baseline read 0.458 instead of 0.75, mis-attributed to
+# "settings"). A dead judge must FAIL LOUD, not deflate accuracy to zero. Two layers:
+#   (1) preflight — before any cell runs, probe a known-CORRECT and known-WRONG pair; abort if the
+#       judge is unreachable or misgrades.
+#   (2) in-run — a judge API failure raises JudgeUnavailable (a distinct signal from an INCORRECT
+#       verdict); transient blips get bounded retries, and a sustained streak aborts the run so no
+#       judge-blind cells reach the results dir.
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "grok-4.5")
+JUDGE_MAX_FAILS = int(os.environ.get("JUDGE_MAX_FAILS", "3"))   # consecutive hard failures → abort loud
+JUDGE_RETRIES = int(os.environ.get("JUDGE_RETRIES", "3"))       # per-call retries for transient blips
+_JUDGE = {"calls": 0, "fails": 0, "consecutive": 0}
+
+
+class JudgeUnavailable(RuntimeError):
+    """The judge API call failed (outage / auth / rate-limit) — NOT a legitimate INCORRECT verdict."""
+
+
+def _judge_raw(messages, max_tokens):
+    """One judge completion. Retries transient blips, then — on a sustained failure — raises
+    JudgeUnavailable (so callers never mistake an outage for a wrong answer) and aborts the whole run
+    once JUDGE_MAX_FAILS consecutive judged items have failed (the judge is down; everything past this
+    point would be garbage)."""
+    _JUDGE["calls"] += 1
+    last = None
+    for attempt in range(max(1, JUDGE_RETRIES)):
+        try:
+            r = judge_cli.chat.completions.create(model=JUDGE_MODEL, temperature=0,
+                                                  max_tokens=max_tokens, messages=messages)
+            _JUDGE["consecutive"] = 0
+            return r.choices[0].message.content or ""
+        except Exception as e:  # noqa: BLE001 — transport/API error: retry, then escalate
+            last = e
+            if attempt + 1 < max(1, JUDGE_RETRIES):
+                time.sleep(1.5 * (attempt + 1))
+    _JUDGE["fails"] += 1
+    _JUDGE["consecutive"] += 1
+    if _JUDGE["consecutive"] >= JUDGE_MAX_FAILS:
+        sys.exit(f"FATAL: judge ({JUDGE_MODEL}) unreachable for {_JUDGE['consecutive']} consecutive "
+                 f"judged items ({_JUDGE['fails']} total) — aborting so a dead judge cannot silently "
+                 f"score every answer INCORRECT. Last error: {type(last).__name__}: {str(last)[:180]}")
+    raise JudgeUnavailable(str(last))
+
+def reason_llm(system, user):
+    r = QWEN.chat.completions.create(model="Qwen3.6-35B-A3B", temperature=0, max_tokens=120,
+        extra_body=NOTHINK, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    return (r.choices[0].message.content or "").strip()
+
+_TRUNC = {"n": 0, "total": 0}   # truncation counter: completions that hit max_tokens (finish_reason=length)
+
+def _gen(model, sys_p, user, *, think, budget):
+    c = MODEL_CFG[model]
+    temp = c.get("temperature", 0)          # per-model: local vLLM=0; reasoning API upstreams need >0
+    if c.get("tier") == "api":              # a native-reasoning upstream eats budget → floor it generously
+        budget = max(budget, THINK_BUDGET)  # else kimi-k2.6 returns EMPTY (reasoning consumed all tokens)
+    r = clients[model].chat.completions.create(model=c["model"], temperature=temp, max_tokens=budget,
+        extra_body=_extra(model, think), messages=[{"role": "system", "content": sys_p},
+                                                    {"role": "user", "content": user}])
+    _TRUNC["total"] += 1
+    if getattr(r.choices[0], "finish_reason", None) == "length":  # trace hit the budget → answer may be lost
+        _TRUNC["n"] += 1
+    return (r.choices[0].message.content or "").strip()
+
+# The deterministic map-reduce aggregator (strategy "aggregate") was REFUTED by the Run-2 audit: at FULL
+# gold it scored 0.083 on longmemeval, WORSE than plain `direct` 0.333 — extract-then-reduce loses
+# information vs letting a thinking model reason over the full context. Dropped. The real lever for the
+# aggregation lane is a thinking answerer over full context (Kimi-k2.6 = 0.75), not code-side reduce.
+
+def answer(model, ctx, q, strategy="direct"):
+    # closed-book (no context): unchanged, terse.
+    if not ctx:
+        return _gen(model, "Answer in as few words as possible. If you do not know, reply exactly: "
+                    "NOT FOUND.", f"Question: {q}\nAnswer:", think=False, budget=96)
+    if strategy == "direct_think":  # NATIVE reasoning (thinking on) + terse prompt — NO CoT scaffolding.
+        # Same direct instruction as the baseline; the model reasons in <think>, we extract the final.
+        # This is the Run-2 answerer test: model reasoning ⟂ the (refuted) prompt strategies.
+        return _final(_gen(model,
+            "Answer using ONLY the provided context. Give the final answer only — as few words as "
+            "possible — on a line beginning 'Answer:'. If the answer is not in the context, reply "
+            "exactly: NOT FOUND.",
+            f"Context:\n{ctx}\n\nQuestion: {q}", think=True, budget=THINK_BUDGET))
+    # `direct` reproduces the prior terse/no-think baseline EXACTLY (verbatim prompt + 96 tok).
+    if strategy in ("direct", "terse"):
+        return _gen(model, "Answer using ONLY the provided context, in as few words as possible. If the "
+                    "answer is not in the context, reply exactly: NOT FOUND.",
+                    f"Context:\n{ctx}\n\nQuestion: {q}\nAnswer:", think=False, budget=96)
+    # reasoning strategies: thinking on, wider budget, recalibrated abstention, 'Answer:' final line.
+    if strategy == "reason":
+        sys_p = ("Answer the question using ONLY the provided context. Think step by step, then give a "
+                 "short final answer on a line beginning 'Answer:'. " + _ABSTAIN)
+    elif strategy == "decompose":
+        sys_p = ("Answer the multi-hop question using ONLY the provided context. First list the "
+                 "intermediate facts needed and answer each from the context, then compose the final "
+                 "answer on a line beginning 'Answer:'. " + _ABSTAIN)
+    elif strategy == "mapreduce":
+        sys_p = ("You aggregate across sources. From the context, extract every relevant fact as a "
+                 "bullet '- (when, who/what, value)', then compute the answer over those facts and give "
+                 "it on a line beginning 'Answer:'. " + _ABSTAIN)
+    else:
+        raise ValueError(f"unknown strategy {strategy!r}")
+    return _final(_gen(model, sys_p, f"Context:\n{ctx}\n\nQuestion: {q}", think=True, budget=GEN_BUDGET))
+
+# Rubric judge (tempo / long-form): exact/alias match fails on essay-shaped answers, so grade COVERAGE
+# of the gold key points (share ≥ RUBRIC_MIN counts correct), not string identity. Enabled per dataset
+# via RUBRIC_DATASETS (e.g. tempo,nutrition). Half eval-hygiene, half real: the model must emit the facts.
+RUBRIC_DATASETS = set(x for x in os.environ.get("RUBRIC_DATASETS", "").split(",") if x)
+RUBRIC_MIN = float(os.environ.get("RUBRIC_MIN", "0.6"))
+
+def _rubric_correct(question, golds, cand):
+    # A JudgeUnavailable here propagates: an outage must not read as "rubric score 0" (that's the very
+    # silent-zeroing this guard exists to stop). The _judge_raw streak guard aborts loud on a real outage.
+    out = _judge_raw(
+        [{"role": "system", "content": "You grade a long-form answer against a rubric. GOLD lists "
+          "the key point(s) a correct answer must convey (phrasing/language/units may differ; the "
+          "answer may add detail). Reply ONLY a number 0..1 = the share of GOLD key points the "
+          "MODEL answer correctly covers."},
+         {"role": "user", "content": f"Q: {question}\nGOLD key points: {' ; '.join(golds)}\nMODEL: {cand}\nScore:"}],
+        max_tokens=6)
+    import re as _re
+    m = _re.search(r"[01](?:\.\d+)?", out)
+    return (float(m.group()) if m else 0.0) >= RUBRIC_MIN
+
+def judge(question, golds, cand, *, dataset=""):
+    if not cand or cand.strip().upper() == "NOT FOUND": return False
+    golds = [str(g) for g in golds if g is not None and str(g).strip()]
+    if any(g.lower() in cand.lower() for g in golds): return True   # substring hit — judge-independent
+    try:
+        if dataset in RUBRIC_DATASETS:
+            return _rubric_correct(question, golds, cand)
+        v = _judge_raw(
+            [{"role": "system", "content": "Strict QA grader. Reply exactly CORRECT or INCORRECT: is the "
+              "MODEL answer correct given any GOLD variant (phrasing/language may differ)?"},
+             {"role": "user", "content": f"Q: {question}\nGOLD: {' / '.join(golds)}\nMODEL: {cand}\nVerdict:"}],
+            max_tokens=8).strip().upper()
+        return "CORRECT" in v and "INCORRECT" not in v
+    except JudgeUnavailable:
+        # A tolerated single blip (bounded retries already exhausted; the streak guard aborts on a real
+        # outage). Score conservatively False for this one item; the end-of-run report surfaces the count.
+        return False
+
+def _judge_preflight():
+    """Fail LOUD before the run if the judge is dead or misgrading — otherwise the tolerated-blip path
+    would let a sustained outage deflate accuracy silently. Probes the LLM-judge path directly (gold
+    that does NOT substring-match the answer, so the grok call is actually exercised): a paraphrase that
+    should grade CORRECT and a wrong city that should grade INCORRECT. Both must land, or we abort."""
+    f0 = _JUDGE["fails"]
+    # Non-substring probes (so the grok path is actually exercised) that are UNAMBIGUOUS — a strict grader
+    # must accept the paraphrase and reject the wrong number. (The old "capital of France"→"The capital
+    # city of France." probe was borderline: it restates the question without naming Paris, so a strict
+    # grok correctly graded it INCORRECT and the preflight false-aborted.)
+    pos = judge("How many continents are there?", ["7"], "There are seven continents.")
+    neg = judge("How many continents are there?", ["7"], "There are five continents.")
+    if _JUDGE["fails"] > f0:
+        sys.exit(f"FATAL: judge ({JUDGE_MODEL}) unreachable during preflight — aborting before any cell "
+                 f"runs so a dead judge can't score every answer INCORRECT. Check XAI_API_KEY / JUDGE_MODEL "
+                 f"and the x.ai endpoint, then re-run.")
+    if not (pos and not neg):
+        sys.exit(f"FATAL: judge ({JUDGE_MODEL}) preflight sanity FAILED (correct-probe={pos}, expected True; "
+                 f"wrong-probe={neg}, expected False) — the judge is misgrading; aborting rather than emit "
+                 f"corrupt accuracy.")
+    print(f"[judge] preflight OK ({JUDGE_MODEL}): correct-probe pass, wrong-probe pass", flush=True)
+
+def ctx_of(texts, budget):
+    out, cap, used = [], budget * 4, 0
+    for t in texts:
+        if used >= cap: break
+        b = t[:cap - used]; out.append(b); used += len(b)
+    return "\n\n".join(out)
+
+_bge = Embedder(); _ri = None
+_emb_cache = {"bge": _bge}
+ACTIVE_EMB = _bge   # the dataset's routed default embedder (set per dataset in the main loop)
+
+def dataset_embedder(name):
+    """(A) The best embedder for a dataset's corpus. EMBED_ROUTING off → always bge (prior behavior)."""
+    if not EMBED_ROUTING:
+        return _bge
+    from redevops_rag.embed import encoder_for, make_embedder
+    lang, domain = DATASET_CORPUS.get(name, ("en", ""))
+    backend = encoder_for(lang, domain)
+    if backend == "colpali":     # doc-visual arm is out of scope for this text cube — fall back to bge
+        backend = "bge"
+    if backend not in _emb_cache:
+        _emb_cache[backend] = make_embedder(backend)
+    return _emb_cache[backend]
+
+def _store(item, embedder):
+    dbp = f"/tmp/c2_{id(embedder)%9999}_{item['qid']}.duckdb"
+    if os.path.exists(dbp): os.remove(dbp)
+    # Fix 2 wiring: an RU corpus (nutrition) needs the Russian FTS stemmer, else BM25 uses English Porter
+    # and misses inflected matches (Фолиновую ↛ фолиновая). English corpora keep the porter/english default.
+    lang, _dom = DATASET_CORPUS.get(CURRENT_DATASET, ("en", ""))
+    fts = {"fts_stemmer": "russian", "fts_stopwords": "none"} if lang == "ru" else {}
+    s = Store(embedder, dbp, **fts)
+    ch = [{"document_id": d["chunk_id"], "text": d["text"], "metadata": {}} for d in item["docs"]]
+    for c, e in zip(ch, embedder.encode([x["text"] for x in ch])): c["embedding"] = e
+    s.add_chunks(ch, reindex=True); return s
+
+def multihop_union(s, q):                                  # (d) cover BOTH bridge hops
+    subs = [x.strip("-• 0123456789.") for x in reason_llm(
+        "Break this question into the 2-3 atomic facts needed to answer it, one per line.", q).splitlines() if x.strip()][:3]
+    seen, hits = set(), []
+    for sq in [q, *subs]:
+        for h in hybrid_search(s, sq, limit=4, pool=15):
+            if h["document_id"] not in seen: seen.add(h["document_id"]); hits.append(h)
+    return hits[:K]
+
+def retrieve_texts(method, item):
+    global _ri
+    if method == "reasonir":
+        if _ri is None: _ri = ReasonIREmbedder(url="http://192.168.40.105:8012/v1/embeddings")
+        s = _store(item, _ri); hits = hybrid_search(s, item["question"], limit=K, pool=25); s.close()
+        return [h["text"] for h in hits]
+    if method == "graphiti":
+        return graphiti_texts(item)
+    s = _store(item, ACTIVE_EMB)
+    if method == "diver":     hits = diver_search(s, item["question"], reason_llm, limit=K, pool=25)
+    elif method == "bm25":    hits = s.bm25_search(item["question"], limit=K)
+    else:                     hits = multihop_union(s, item["question"]) if item["regime"] == "graph" else hybrid_search(s, item["question"], limit=K, pool=25)
+    s.close()
+    return [h["text"] for h in hits]
+
+_graphiti_cache = {}
+def graphiti_texts(item):
+    import graphiti_core.llm_client.openai_generic_client as _ogc, datetime as dt
+    _OC = _ogc.OpenAIGenericClient
+    if not getattr(_OC, "_capped", False):
+        class _C(_OC):
+            _capped = True
+            def __init__(self, *a, **k): k.setdefault("max_tokens", 1024); super().__init__(*a, **k)
+        _ogc.OpenAIGenericClient = _C
+    from context_runtime.adapters.store_temporal import GraphitiTemporalRetriever
+    gid = "c2_" + hashlib.md5(item["qid"].encode()).hexdigest()[:12]
+    g = GraphitiTemporalRetriever(neo4j_uri="bolt://192.168.40.105:7687",
+                                  llm_base_url="http://192.168.40.105:30807/v1", llm_model="Qwen3.6-35B-A3B", group_id=gid)
+    base = dt.datetime(2023, 1, 1)
+    g.index([{"name": d["chunk_id"], "body": d["text"][:4000],
+              "reference_time": (base - dt.timedelta(hours=i)).isoformat()} for i, d in enumerate(item["docs"][:20])])
+    hits = g.search(item["question"], k=K)
+    try: g.close()
+    except Exception: pass
+    return [h.text for h in hits]
+
+def cr_route(item, model):
+    """Route the query to (retriever, model, strategy). Competence-routed off the cube when CR_ROUTES is
+    set (finding #5): the measured best (method, strategy) per class beats the regime heuristics. Falls
+    back to the bottleneck-aware regime rules otherwise."""
+    rep = router.classify(item["question"]) or "document"
+    if ROUTES:  # competence route from the measured cube (by_dataset ceiling → by_rep runtime route)
+        route = ROUTES.get("by_dataset", {}).get(CURRENT_DATASET) or ROUTES.get("by_rep", {}).get(rep)
+        if route:
+            texts = retrieve_texts(route["method"], item)
+            # temporal is also model-bound → still allow model escalation (the route is qwen-only for now)
+            use_model = (STRONGEST if (rep == "temporal" and STRONGEST in clients
+                         and MODEL_CFG[STRONGEST]["rank"] > MODEL_CFG[model]["rank"]) else model)
+            return use_model, texts, route["strategy"]
+    if rep == "temporal":                      # temporal-reasoning = RETRIEVAL- AND MODEL-sensitive
+        # DIVER is now in the temporal routed set: on TEMPO it scores 0.91 vs hybrid 0.84 (and vs the
+        # graph engines' 0.24-0.28), so temporal retrieves with DIVER, not plain hybrid — the fix for
+        # CR-auto's TEMPO gap. Still escalate the model (temporal aggregation is also model-bound).
+        use_model = STRONGEST if (STRONGEST in clients and MODEL_CFG[STRONGEST]["rank"] > MODEL_CFG[model]["rank"]) else model
+        texts = retrieve_texts("diver", item)
+    elif rep == "graph":                        # multi-hop = RETRIEVAL-bound
+        use_model, texts = model, retrieve_texts("diver", item)
+    else:
+        use_model, texts = model, retrieve_texts("hybrid", item)
+    return use_model, texts, REGIME_STRATEGY.get(rep, "direct")
+
+def load(name):
+    rows = [json.loads(l) for l in open(f"{DATADIR}/{name}.jsonl")]
+    rows.sort(key=lambda r: hashlib.md5(r["qid"].encode()).hexdigest())
+    return [r for r in rows if str(r.get("answer", "")).strip()][:N]
+
+print(f"models={MODELS} methods={METHODS} conds={CONDS} datasets={DATASETS} N={N} K={K}", flush=True)
+_judge_preflight()   # abort loud on a dead/misgrading judge BEFORE any cell is written
+for name in DATASETS:
+    items = load(name)
+    CURRENT_DATASET = name                # competence-routed cr-auto reads this for the by_dataset ceiling
+    ACTIVE_EMB = dataset_embedder(name)   # (A) route the dataset's default embedder (bge unless EMBED_ROUTING)
+    if EMBED_ROUTING:
+        print(f"  [embed-routing] {name} -> {getattr(ACTIVE_EMB, 'backend', 'bge')} (dim={ACTIVE_EMB.dim})", flush=True)
+    goldtext = {it["qid"]: [d["text"] for d in it["docs"] if d["chunk_id"] in set(it["gold"])] for it in items}
+    for method in METHODS:
+        # precompute retrieved context per item (reused across models & conds)
+        retr = {}
+        if "retrieved" in CONDS and method != "cr-auto":
+            for it in items: retr[it["qid"]] = ctx_of(retrieve_texts(method, it), ctx_budget(name, "retrieved"))
+        for model in MODELS:
+            if model not in clients: continue
+            for strat in STRATEGIES:            # generation-strategy axis (Phase-0 answer-plane ablation)
+                res = {c: [] for c in CONDS}
+                for it in items:
+                    golds = [it["answer"], *it.get("aliases", [])]
+                    for cond in CONDS:
+                        if cond == "closed":   ctx = ""
+                        elif cond == "oracle": ctx = ctx_of(goldtext[it["qid"]], ctx_budget(name, "oracle"))
+                        else:  # retrieved
+                            if method == "cr-auto":
+                                m, texts, cr_strat = cr_route(it, model); ctx = ctx_of(texts, ctx_budget(name, "retrieved"))
+                                use_strat = cr_strat if CR_COUPLE else strat   # (B) couple inference to regime
+                                res[cond].append(judge(it["question"], golds, answer(m, ctx, it["question"], use_strat), dataset=name)); continue
+                            ctx = retr[it["qid"]]
+                        res[cond].append(judge(it["question"], golds, answer(model, ctx, it["question"], strat), dataset=name))
+                cell = {"dataset": name, "method": method, "model": model, "strategy": strat, "n": len(items),
+                        **{f"acc_{c}": round(st.mean(res[c]), 3) if res[c] else None for c in CONDS}}
+                json.dump(cell, open(f"{RES}/{name}__{method}__{model}__{strat}.json", "w"))
+                print(f"  {name:11} {method:8} {model:9} {strat:9} " + " ".join(f"{c}={cell.get('acc_'+c)}" for c in CONDS), flush=True)
+if _TRUNC["total"]:
+    print(f"truncation: {_TRUNC['n']}/{_TRUNC['total']} completions hit max_tokens "
+          f"({100*_TRUNC['n']/_TRUNC['total']:.1f}%) — raise THINK_BUDGET if high (lost final answers)", flush=True)
+if _JUDGE["fails"]:
+    print(f"judge: {_JUDGE['fails']}/{_JUDGE['calls']} judge call(s) failed after retries "
+          f"({100*_JUDGE['fails']/max(1,_JUDGE['calls']):.1f}%) — those items were scored INCORRECT on a "
+          f"tolerated blip; re-run if non-trivial (accuracy is a floor, not the true value)", flush=True)
+print("CUBE2_DONE", flush=True)

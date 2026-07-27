@@ -1,0 +1,20 @@
+stream=45 (lookup, multi-hop, temporal) | pollute=30 | answerer=Qwen3.6-35B-A3B
+  5/45
+  10/45
+  15/45
+  20/45
+  25/45
+  30/45
+  35/45
+  40/45
+  45/45
+
+=== capability ladder — mixed stream (45 q: 15/regime, Qwen3.6-35B-A3B, grok-judged) ===
+config      mechanism                         acc   tok/q   per-regime acc
+v1_base     naive dump                      0.533    4014   look=1.00  mult=0.47  temp=0.13
+v2_sizer    + gating/sizer/abstain          0.444    1582   look=1.00  mult=0.27  temp=0.07
+v3_online   + online arm bandit             0.444    1647   look=1.00  mult=0.27  temp=0.07
+v4_route    + knowledge routing             0.444    1628   look=1.00  mult=0.27  temp=0.07
+v5_diver    + DIVER reasoning retrieval     0.511    1686   look=1.00  mult=0.47  temp=0.07
+DONE
+LADDER_DONE

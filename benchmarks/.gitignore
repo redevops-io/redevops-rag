@@ -1,0 +1,7 @@
+# Benchmark corpora are not redistributed here (see DATA_SOURCES.md).
+# The nutrition material is third-party copyrighted (a named author's lectures,
+# exported from Telegram); it must never be committed or redistributed. It is
+# rebuilt locally from the private nutribot DB via build_nutrition.py.
+nutrition_src/
+nutrition_corpus.jsonl
+datasets/nutrition.jsonl

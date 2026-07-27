@@ -1,0 +1,1 @@
+{"method": "simgraph", "dataset": "musique", "regime": "multi-hop", "n": 1, "recall": 0.5, "ndcg": 0.6131}

@@ -185,3 +185,94 @@ def test_rag_facade_rejects_pg_kwargs_with_duckdb(tmp_path):
 
     with pytest.raises(ValueError, match="Postgres db_path"):
         rag_mod.RAG(db_path=str(tmp_path / "x.duckdb"), table="foo")
+
+
+# ── parity with the DuckDB Store: metadata stamp, document_ids scoping, asymmetric query ──────
+class _StampEmbedder(_FakeEmbedder):
+    """A fake encoder that carries a backend tag + an asymmetric query side (like Nemotron)."""
+    backend = "nemotron"
+    model_name = "nemotron-embed"
+
+    def __init__(self):
+        self.q_calls = []
+
+    def encode_queries(self, texts):
+        self.q_calls += list(texts)
+        return self.encode(texts)
+
+
+def test_meta_stamp_and_get(store):
+    # _FakeEmbedder has no .backend → nothing stamped automatically; set_meta/get_meta still work.
+    store.set_meta(backend="bge", model="bge-small", dim=32, lang="en")
+    assert store.get_meta("backend") == "bge"
+    assert store.get_meta("dim") == 32
+    assert store.get_meta()["lang"] == "en"
+
+
+def test_stamp_encoder_records_backend_once():
+    from redevops_rag.pg_store import PgStore
+    table = f"rag_test_{uuid.uuid4().hex[:12]}"
+    s = PgStore(_StampEmbedder(), PG_URL, table=table)
+    try:
+        assert s.get_meta("backend") == "nemotron"   # stamped from the embedder in __init__
+        assert s.get_meta("dim") == 32
+    finally:
+        with s.con.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
+        s.con.commit(); s.close()
+
+
+def test_open_pg_store_reconstructs_encoder(monkeypatch):
+    from redevops_rag import pg_store as pg_mod
+    table = f"rag_test_{uuid.uuid4().hex[:12]}"
+    s = pg_mod.PgStore(_StampEmbedder(), PG_URL, table=table)
+    s.close()
+    built = {}
+
+    def fake_make(backend=None, **kw):
+        built["backend"] = backend
+        return _StampEmbedder()
+
+    monkeypatch.setattr("redevops_rag.embed.make_embedder", fake_make)
+    s2 = pg_mod.open_pg_store(PG_URL, table=table)
+    try:
+        assert built["backend"] == "nemotron"        # reopened with the stamped encoder
+    finally:
+        with s2.con.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
+        s2.con.commit(); s2.close()
+
+
+def test_document_ids_scope_semantic_and_bm25(store, embedder):
+    e = embedder.encode(["alpha microbiome doc", "beta microbiome doc"])
+    store.add_chunks([
+        {"id": "a", "document_id": "DA", "text": "alpha microbiome doc", "embedding": e[0]},
+        {"id": "b", "document_id": "DB", "text": "beta microbiome doc", "embedding": e[1]},
+    ], reindex=True)
+    sem = store.semantic_search("microbiome", top_k=10, threshold=-1.0, document_ids=["DA"])
+    assert sem and all(h["document_id"] == "DA" for h in sem)
+    bm = store.bm25_search("microbiome", limit=10, document_ids=["DB"])
+    assert bm and all(h["document_id"] == "DB" for h in bm)
+
+
+def test_query_mode_uses_encode_queries():
+    from redevops_rag.pg_store import PgStore
+    table = f"rag_test_{uuid.uuid4().hex[:12]}"
+    emb = _StampEmbedder()
+    s = PgStore(emb, PG_URL, table=table)
+    try:
+        s.add_chunks([{"id": "a", "document_id": "D", "text": "immune signalling",
+                       "embedding": emb.encode(["immune signalling"])[0]}], reindex=True)
+        emb.q_calls.clear()
+        s.semantic_search("immune", top_k=5, threshold=-1.0, query_mode="instruct")
+        assert emb.q_calls == ["immune"]             # asymmetric query side was used
+        emb.q_calls.clear()
+        s.semantic_search("immune", top_k=5, threshold=-1.0, query_mode="plain")
+        assert emb.q_calls == []                     # plain never calls encode_queries
+    finally:
+        with s.con.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
+        s.con.commit(); s.close()
