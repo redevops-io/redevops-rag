@@ -1,0 +1,1 @@
+{"dataset": "nutrition", "method": "reasonir", "model": "api", "strategy": "direct", "n": 24, "acc_oracle": 0.958, "acc_retrieved": 0.958}

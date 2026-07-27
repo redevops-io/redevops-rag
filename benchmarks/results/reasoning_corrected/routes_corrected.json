@@ -1,0 +1,59 @@
+{
+  "select_cond": "acc_retrieved",
+  "by_dataset": {
+    "popqa": {
+      "method": "bm25",
+      "strategy": "direct_think",
+      "oracle": 1.0,
+      "retrieved": 1.0
+    },
+    "nutrition": {
+      "method": "bm25",
+      "strategy": "direct",
+      "oracle": 0.958,
+      "retrieved": 1.0
+    },
+    "longmemeval": {
+      "method": "reasonir",
+      "strategy": "direct_think",
+      "oracle": 0.875,
+      "retrieved": 0.875
+    },
+    "musique": {
+      "method": "diver",
+      "strategy": "direct_think",
+      "oracle": 0.625,
+      "retrieved": 0.708
+    },
+    "tempo": {
+      "method": "diver",
+      "strategy": "direct",
+      "oracle": 1.0,
+      "retrieved": 0.917
+    }
+  },
+  "by_rep": {
+    "document": {
+      "method": "bm25",
+      "strategy": "direct",
+      "score": 0.9895
+    },
+    "temporal": {
+      "method": "diver",
+      "strategy": "direct_think",
+      "score": 0.8335
+    },
+    "graph": {
+      "method": "diver",
+      "strategy": "direct_think",
+      "score": 0.6665
+    }
+  },
+  "dataset_rep": {
+    "popqa": "document",
+    "nutrition": "document",
+    "musique": "graph",
+    "longmemeval": "temporal",
+    "tempo": "temporal"
+  }
+}

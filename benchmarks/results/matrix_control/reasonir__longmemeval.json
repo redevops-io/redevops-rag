@@ -1,0 +1,1 @@
+{"method": "reasonir", "dataset": "longmemeval", "regime": "temporal", "n": 15, "recall": 0.9533, "ndcg": 0.9008}

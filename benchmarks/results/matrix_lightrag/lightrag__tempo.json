@@ -1,0 +1,1 @@
+{"method": "lightrag", "dataset": "tempo", "regime": "temporal-reasoning", "n": 15, "recall": 0.4866, "ndcg": 0.6473}

@@ -1,0 +1,1 @@
+{"dataset": "popqa", "method": "cr-auto", "model": "api", "strategy": "direct", "n": 24, "acc_oracle": 1, "acc_retrieved": 1}

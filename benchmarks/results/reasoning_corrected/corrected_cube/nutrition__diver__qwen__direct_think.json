@@ -1,0 +1,1 @@
+{"dataset": "nutrition", "method": "diver", "model": "qwen", "strategy": "direct_think", "n": 24, "acc_oracle": 0.958, "acc_retrieved": 0.875}

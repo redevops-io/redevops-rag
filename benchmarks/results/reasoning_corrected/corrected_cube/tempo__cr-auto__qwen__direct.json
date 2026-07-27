@@ -1,0 +1,1 @@
+{"dataset": "tempo", "method": "cr-auto", "model": "qwen", "strategy": "direct", "n": 24, "acc_oracle": 0.75, "acc_retrieved": 0.625}

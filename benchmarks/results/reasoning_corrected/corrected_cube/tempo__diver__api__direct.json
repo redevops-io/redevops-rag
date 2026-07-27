@@ -1,0 +1,1 @@
+{"dataset": "tempo", "method": "diver", "model": "api", "strategy": "direct", "n": 24, "acc_oracle": 1, "acc_retrieved": 0.917}

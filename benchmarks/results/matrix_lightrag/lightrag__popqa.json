@@ -1,0 +1,1 @@
+{"method": "lightrag", "dataset": "popqa", "regime": "lookup", "n": 15, "recall": 0.0667, "ndcg": 0.0667}
