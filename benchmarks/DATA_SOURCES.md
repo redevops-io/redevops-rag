@@ -2,6 +2,10 @@
 
 The benchmark datasets here derive from the public sources below (plus one proprietary internal corpus). Loaders/builders fetch or rebuild the data; we do not redistribute raw upstream data. Each dataset stays under its own license.
 
+## How this data is used
+
+These datasets are used solely to develop and benchmark the Context Runtime software itself (internal R&D and regression testing of stack improvements). They are NOT redistributed, NOT embedded in or shipped with the product, and NOT part of any customer deployment. Context Runtime customers apply the software to their own data under their own data licenses.
+
 ## MuSiQue (multi-hop QA) - datasets/musique.jsonl
 - Source: https://github.com/StonyBrookNLP/musique
 - License: CC-BY-4.0.
