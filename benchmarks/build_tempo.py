@@ -13,6 +13,8 @@ docs = the person's/entity's time-scoped facts (the timeline); gold = the whole 
 tests reasoning-over-the-timeline, not lookup); created_at parsed from each fact's start date.
 
     TEMPO_LEVELS=l2,l3 TEMPO_N=300 OUT=/path/datasets/tempo.jsonl python benchmarks/build_tempo.py
+
+License: CC-BY-SA-3.0 (TempReason).
 """
 import hashlib
 import json
