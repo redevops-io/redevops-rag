@@ -34,3 +34,4 @@ These datasets are used solely to develop and benchmark the Context Runtime soft
 ## Nutrition (RU) - datasets/nutrition.jsonl - PROPRIETARY, not public
 - Source: internal nutribot corpus - Russian nutrition-lecture material (third-party author "Nezhenskaya"), exported from Telegram; Q/A LLM-generated over it.
 - License: none. This is third-party copyrighted course content used INTERNALLY as an anti-contamination control (no model could have trained on it). It is NOT redistributed; only aggregate recall figures are ever reported. Not an open dataset.
+- Note: rebuilt 2026-07-22 (the original set was lost when systemd-tmpfiles swept `/tmp`); recall figures are **not comparable** to previously published nutrition numbers.
