@@ -8,7 +8,7 @@ carved out of its multi-tenant SaaS shell (no Auth0/Stripe/Kubernetes/workspace 
 you can drop the *same* retrieval over any folder — a docs tree, a repo, an Obsidian vault —
 in three lines.
 
-> **Versioning — backwards-compatible across v1 · v2 · v3 · v4.** The library API, CLI, and on-disk index/store format from every prior version keep working — upgrade in place, no migration.
+> **Versioning — the ported pipeline stays backwards-compatible across its v1 · v2 · v3 · v4 lineage.** The library API, CLI, and on-disk index/store format from every prior pipeline version keep working — upgrade in place, no migration. (The `redevops-rag` package itself is at v0.1 — see the status note below.)
 
 ## Pipeline
 
@@ -77,7 +77,8 @@ small — those belong in **git**, not in a RAG.
 | `REDEVOPS_RAG_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | cross-encoder for `--rerank` |
 | `REDEVOPS_RAG_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | — | OpenAI-compatible endpoint for `ask` |
 
-> Status: **v0.1, not yet large-corpus benchmarked.** The retrieval logic is a faithful port
-> of the production pipeline; the packaging/CLI are new. Validate on your own data.
+> Status: **v0.1. Validated with a small-N eval suite (`benchmarks/`); not yet large-corpus
+> benchmarked.** The retrieval logic is a faithful port of the production pipeline; the
+> packaging/CLI are new. Validate on your own data.
 
 AGPL-3.0-or-later · redevops.io

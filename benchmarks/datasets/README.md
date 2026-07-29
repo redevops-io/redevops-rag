@@ -10,6 +10,6 @@ or rebuild them. Full source + license details are in [../DATA_SOURCES.md](../DA
 | `popqa.jsonl` | Entity / long-tail QA | AlexTMallen/adaptive-retrieval (HF `akariasai/PopQA`) | MIT | public (distractor docs synthetic) |
 | `longmemeval.jsonl` | Long-term conversational memory | xiaowu0162/LongMemEval (HF `xiaowu0162/longmemeval`) | MIT | public |
 | `tempo.jsonl` | Temporal reasoning | HF `tonytan48/TempReason` (DAMO-NLP-SG) | CC-BY-SA-3.0 | rebuilt by `../build_tempo.py` |
-| `nutrition.jsonl` | Nutrition retrieval (RU) | internal nutribot corpus (third-party copyrighted) | none (proprietary) | PROPRIETARY - not public, not redistributed |
+| `nutrition.jsonl` | Nutrition retrieval (RU) | internal nutribot corpus (third-party copyrighted) | none (proprietary) | PROPRIETARY - not public, not redistributed (rebuilt 2026-07-22; not comparable to prior numbers) |
 
 See [../DATA_SOURCES.md](../DATA_SOURCES.md) for citations, exact URLs, and terms.
