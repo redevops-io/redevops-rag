@@ -104,16 +104,71 @@ class NemotronEmbedder:
         return self._post([self.QUERY_INSTRUCTION + str(q) for q in queries])
 
 
+class NemoRetrieverEmbedder:
+    """NVIDIA **NeMo Retriever** embedding NIM (e.g. ``nvidia/llama-3.2-nv-embedqa``) over its
+    OpenAI-compatible ``/v1/embeddings`` endpoint. Drop-in for :class:`Embedder` — exposes
+    ``encode`` + ``dim`` — so a :class:`Store` built with it embeds both documents and queries
+    through the NIM.
+
+    This is a *capability behind the existing RAG contract*, not a replacement: ReDevOps RAG keeps
+    owning chunk identity, provenance and ranking evidence; the NIM only supplies vectors. Serve it
+    on GPU (``docker run … nvcr.io/nim/nvidia/llama-3.2-nv-embedqa-1b-v2``); the container exposes
+    ``/v1/embeddings``.
+
+    Like the other NVIDIA retrieval embedders the embedqa NIM is **asymmetric**: it takes an
+    ``input_type`` (``passage`` for documents, ``query`` for queries) rather than an instruction
+    prefix. ``encode`` embeds passages; :meth:`encode_queries` flips ``input_type`` to ``query``.
+    """
+
+    backend = "nemo-retriever"
+    #: embedqa's cosine sims run compressed vs bge (like Nemotron), so the bge-calibrated 0.4 floor
+    #: would discard the top-ranked chunk. A low floor keeps the top ranks; RRF/rerank order them.
+    sim_floor = 0.1
+
+    def __init__(self, url: str | None = None, model: str | None = None, dim: int | None = None,
+                 api_key: str | None = None, batch: int = 32, max_chars: int = 24000,
+                 timeout: float = 180.0):
+        self.url = (url or os.environ.get("REDEVOPS_RAG_NEMO_URL")
+                    or "http://127.0.0.1:8014/v1/embeddings")
+        self.model = model or os.environ.get("REDEVOPS_RAG_NEMO_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")
+        self.dim = int(dim or os.environ.get("REDEVOPS_RAG_NEMO_DIM", "2048"))
+        self.api_key = api_key if api_key is not None else os.environ.get("REDEVOPS_RAG_NEMO_API_KEY", "")
+        self.batch, self.max_chars, self.timeout = batch, max_chars, timeout
+
+    def _post(self, inputs: list[str], input_type: str) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(inputs), self.batch):
+            chunk = [str(t)[: self.max_chars] for t in inputs[i:i + self.batch]]
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            body = {"model": self.model, "input": chunk, "input_type": input_type}
+            req = urllib.request.Request(self.url, data=json.dumps(body).encode(), headers=headers)
+            data = json.load(urllib.request.urlopen(req, timeout=self.timeout))
+            out += [d["embedding"] for d in sorted(data["data"], key=lambda x: x["index"])]
+        return out
+
+    def encode(self, texts: Iterable[str]) -> list[list[float]]:
+        return self._post(list(texts), "passage")
+
+    def encode_queries(self, queries: Iterable[str]) -> list[list[float]]:
+        """Embed queries with ``input_type="query"`` (embedqa's asymmetric query side)."""
+        return self._post([str(q) for q in queries], "query")
+
+
 def make_embedder(backend: str | None = None, **kw):
     """Return the embedder for ``backend`` (env ``REDEVOPS_RAG_EMBED_BACKEND``; default ``bge``).
 
-    ``bge`` → :class:`Embedder` · ``nemotron`` → :class:`NemotronEmbedder` · ``reasonir`` →
+    ``bge`` → :class:`Embedder` · ``nemo``/``nemo-retriever`` → :class:`NemoRetrieverEmbedder` ·
+    ``nemotron`` → :class:`NemotronEmbedder` · ``reasonir`` →
     :class:`~redevops_rag.temporal.ReasonIREmbedder` · ``colpali``/``colqwen`` →
     :class:`~redevops_rag.multimodal.ColVisionEmbedder` (the doc-visual arm). One factory so the
     bench and the CR adapters select an encoder from the environment without branching at every
     call site. To route by corpus instead of a fixed backend, see :func:`encoder_for`."""
     backend = (backend or os.environ.get("REDEVOPS_RAG_EMBED_BACKEND", "bge")).strip().lower()
-    if backend in ("nemotron", "nemotron-embed", "nemo"):
+    if backend in ("nemo", "nemo-retriever"):
+        return NemoRetrieverEmbedder(**kw)
+    if backend in ("nemotron", "nemotron-embed"):
         return NemotronEmbedder(**kw)
     if backend == "reasonir":
         from .temporal import ReasonIREmbedder
