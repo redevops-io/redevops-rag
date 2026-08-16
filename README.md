@@ -80,4 +80,11 @@ small — those belong in **git**, not in a RAG.
 > Status: **v0.1, not yet large-corpus benchmarked.** The retrieval logic is a faithful port
 > of the production pipeline; the packaging/CLI are new. Validate on your own data.
 
+## Architecture
+
+The ReDevOps runtimes use a **functional-core / imperative-shell** design: deterministic
+transformations (fusion, scoring, canonicalization) are pure functions over frozen value
+contracts, while stores and providers sit behind small interfaces at the boundary. See
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 AGPL-3.0-or-later · redevops.io
