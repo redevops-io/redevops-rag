@@ -1,0 +1,1 @@
+{"dataset": "tempo", "method": "reasonir", "model": "qwen", "strategy": "direct", "n": 24, "acc_oracle": 0.75, "acc_retrieved": 0.708}

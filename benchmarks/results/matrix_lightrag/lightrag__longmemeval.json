@@ -1,0 +1,1 @@
+{"method": "lightrag", "dataset": "longmemeval", "regime": "temporal", "n": 15, "recall": 0.4944, "ndcg": 0.5087}

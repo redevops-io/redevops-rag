@@ -1,0 +1,1 @@
+{"method": "simgraph", "dataset": "longmemeval", "regime": "temporal", "n": 15, "recall": 0.7867, "ndcg": 0.5277}

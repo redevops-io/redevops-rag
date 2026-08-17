@@ -1,0 +1,1 @@
+{"dataset": "longmemeval", "method": "hybrid", "model": "api", "strategy": "direct", "n": 24, "acc_oracle": 0.875, "acc_retrieved": 0.833}

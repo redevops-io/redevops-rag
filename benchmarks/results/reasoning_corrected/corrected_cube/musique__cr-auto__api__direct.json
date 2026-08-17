@@ -1,0 +1,1 @@
+{"dataset": "musique", "method": "cr-auto", "model": "api", "strategy": "direct", "n": 24, "acc_oracle": 0.542, "acc_retrieved": 0.542}

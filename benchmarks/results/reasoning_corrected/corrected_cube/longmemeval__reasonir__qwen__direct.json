@@ -1,0 +1,1 @@
+{"dataset": "longmemeval", "method": "reasonir", "model": "qwen", "strategy": "direct", "n": 24, "acc_oracle": 0.167, "acc_retrieved": 0.333}

@@ -226,6 +226,99 @@ def make_engine(method):
         def run(item, docs):
             return _engine_for(_route_method(item))(item, docs)
         return run
+    if method == "lightrag":
+        # LightRAG (HKUDS): dual-level graph — LLM-extracted entity/relation KG + naive vector chunks,
+        # fused in "mix" mode. Per item we build a FRESH working_dir, insert the polluted corpus with
+        # ids == file_paths == chunk_id (so retrieved chunks map straight back to gold), then query with
+        # only_need_context=True (no final generation — we want the RANKED retrieval, not an answer) and
+        # include_references=True. Speed/robustness are env-tuned at launch (set BEFORE this import):
+        #   MAX_GLEANING=0            — skip the extra extraction pass (the dominant per-doc cost)
+        #   MAX_ASYNC=8               — endpoint is free; 4→8 concurrent extraction calls
+        #   MAX_EXTRACTION_RECORDS/ENTITIES — cap pathological docs (e.g. an ISO-3166 list that spawns
+        #                               dozens of relations and 480s-timeouts a single extraction)
+        #   FORCE_LLM_SUMMARY_ON_MERGE=99 — don't re-summarize merged entities via the LLM
+        # A doc whose extraction still times out is DROPPED by LightRAG (logged) and the item proceeds on
+        # the surviving docs — graceful degradation, no item-level crash. LIGHTRAG_DOC_CAP bounds body chars.
+        import asyncio as _aio, numpy as _np, shutil as _sh, re as _re
+        from lightrag import LightRAG, QueryParam
+        from lightrag.llm.openai import openai_complete_if_cache
+        from lightrag.utils import EmbeddingFunc
+        from lightrag.kg.shared_storage import initialize_pipeline_status
+        from redevops_rag.embed import Embedder
+        _emb = Embedder()
+        _MODE = os.environ.get("LIGHTRAG_MODE", "mix")
+        _DOC_CAP = int(os.environ.get("LIGHTRAG_DOC_CAP", "3000"))
+        async def _llm(prompt, system_prompt=None, history_messages=[], **kw):
+            kw.pop("keyword_extraction", None)
+            # Disable Qwen3.6 thinking for extraction/keywording — same NOTHINK the other methods use.
+            # Without this, every per-doc entity-extraction call emits a long reasoning trace (~2 min/doc,
+            # untenable at 35 docs/item). Entity/keyword extraction needs no chain-of-thought. Merge (not
+            # overwrite) any extra_body LightRAG may pass.
+            eb = dict(kw.pop("extra_body", None) or {})
+            eb.setdefault("chat_template_kwargs", {"enable_thinking": False})
+            return await openai_complete_if_cache("Qwen3.6-35B-A3B", prompt, system_prompt=system_prompt,
+                history_messages=history_messages or [], base_url=QWEN, api_key="EMPTY", extra_body=eb, **kw)
+        async def _embed(texts):
+            return _np.array(_emb.encode(list(texts)), dtype=_np.float32)
+        def _ranked_from_ctx(ctx, valid):
+            # LightRAG renders a "Reference Document List" fenced block mapping each retrieved chunk's
+            # reference_id to its file_path (== our chunk_id): lines like "[1] p13\n[2] p3". reference_id
+            # order IS the retrieval rank. CAUTION: the phrase "Reference Document List" also appears
+            # inside the Document Chunks header ("...refer to the `Reference Document List`..."), so a
+            # naive `Reference Document List.*?```...```` grabs the WRONG (chunks) block. Instead scan
+            # every fenced block and take the one whose lines actually look like "[n] <path>".
+            s = ctx if isinstance(ctx, str) else json.dumps(ctx)
+            validset = set(valid)
+            out, seen = [], set()
+            for block in _re.findall(r"```(.*?)```", s, _re.S):
+                pairs = _re.findall(r"^\s*\[(\d+)\]\s+(\S.*?)\s*$", block, _re.M)
+                if not pairs:
+                    continue
+                for _, p in sorted((int(rid), p.strip()) for rid, p in pairs):
+                    if p in validset and p not in seen:
+                        seen.add(p); out.append(p)
+                if out:
+                    return out
+            # fallback (no reference list — e.g. naive mode with a different render): appearance scan
+            pos = sorted((s.find(c), c) for c in valid if s.find(c) >= 0)
+            for _, c in pos:
+                if c not in seen:
+                    seen.add(c); out.append(c)
+            return out
+        async def _build_query(item, docs):
+            wd = f"/tmp/lr_mx/{item['qid']}"
+            _sh.rmtree(wd, ignore_errors=True); os.makedirs(wd, exist_ok=True)
+            rag = LightRAG(working_dir=wd, llm_model_func=_llm,
+                embedding_func=EmbeddingFunc(embedding_dim=_emb.dim, max_token_size=512, func=_embed))
+            await rag.initialize_storages(); await initialize_pipeline_status()
+            # Dedup by chunk_id: some corpora (e.g. popqa) reuse the same popular-entity doc across items,
+            # so corpus_for can yield repeated chunk_ids. Store-based methods tolerate dup document_ids;
+            # LightRAG's ainsert hard-requires unique ids. Keep first occurrence — same retrievable set,
+            # gold ids preserved (distractors are noise_-prefixed, so they never collide with gold).
+            ids, texts, _seen = [], [], set()
+            for d in docs:
+                cid = d["chunk_id"]
+                if cid in _seen:
+                    continue
+                _seen.add(cid); ids.append(cid); texts.append(d["text"][:_DOC_CAP])
+            await rag.ainsert(texts, ids=ids, file_paths=ids)
+            ctx = await rag.aquery(item["question"], param=QueryParam(
+                mode=_MODE, only_need_context=True, chunk_top_k=K, include_references=True))
+            try: await rag.finalize_storages()
+            except Exception: pass
+            return _ranked_from_ctx(ctx, ids)
+        # ONE persistent event loop for the whole run. LightRAG spawns a persistent per-process worker
+        # pool (priority_limit_async_func_call) on first use; a fresh new_event_loop()+close() PER ITEM
+        # orphans those workers ("Event loop is closed" at teardown) and leaks a loop+worker set each
+        # item. Reusing a single loop keeps the global workers stable across items (they're stateless LLM
+        # executors; KG state is per-instance via working_dir), so there's no leak — just one teardown
+        # burst at process exit, after results are already written.
+        _loop = {"l": None}
+        def run(item, docs):
+            if _loop["l"] is None:
+                _loop["l"] = _aio.new_event_loop()
+            return _loop["l"].run_until_complete(_build_query(item, docs))
+        return run
     raise ValueError(method)
 
 # ---------- run ----------
