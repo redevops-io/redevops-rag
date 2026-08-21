@@ -99,18 +99,23 @@ class PgStore:
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self._qtable} (
-                    id          TEXT PRIMARY KEY,
-                    document_id TEXT,
-                    filename    TEXT,
-                    chunk_index INT,
-                    text        TEXT NOT NULL,
-                    embedding   VECTOR({self.dim}),
-                    metadata    JSONB,
-                    created_at  TIMESTAMPTZ,
-                    text_tsv    TSVECTOR GENERATED ALWAYS AS
-                                (to_tsvector('english', coalesce(text, ''))) STORED
+                    id           TEXT PRIMARY KEY,
+                    document_id  TEXT,
+                    filename     TEXT,
+                    chunk_index  INT,
+                    content_hash TEXT,
+                    text         TEXT NOT NULL,
+                    embedding    VECTOR({self.dim}),
+                    metadata     JSONB,
+                    created_at   TIMESTAMPTZ,
+                    text_tsv     TSVECTOR GENERATED ALWAYS AS
+                                 (to_tsvector('english', coalesce(text, ''))) STORED
                 )
                 """
+            )
+            # Migrate a legacy corpus (built before content-addressed identity) in place.
+            cur.execute(
+                f"ALTER TABLE {self._qtable} ADD COLUMN IF NOT EXISTS content_hash TEXT"
             )
             cur.execute(
                 f'CREATE INDEX IF NOT EXISTS "{self.table}_tsv_idx" '
@@ -176,6 +181,7 @@ class PgStore:
                     c.get("document_id"),
                     c.get("filename"),
                     int(c.get("chunk_index", 0)),
+                    c.get("content_hash"),
                     c["text"],
                     c["embedding"],
                     json.dumps(c.get("metadata") or {}),
@@ -188,17 +194,18 @@ class PgStore:
             cur.executemany(
                 f"""
                 INSERT INTO {self._qtable}
-                    (id, document_id, filename, chunk_index, text,
+                    (id, document_id, filename, chunk_index, content_hash, text,
                      embedding, metadata, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 ON CONFLICT (id) DO UPDATE SET
-                    document_id = EXCLUDED.document_id,
-                    filename    = EXCLUDED.filename,
-                    chunk_index = EXCLUDED.chunk_index,
-                    text        = EXCLUDED.text,
-                    embedding   = EXCLUDED.embedding,
-                    metadata    = EXCLUDED.metadata,
-                    created_at  = EXCLUDED.created_at
+                    document_id  = EXCLUDED.document_id,
+                    filename     = EXCLUDED.filename,
+                    chunk_index  = EXCLUDED.chunk_index,
+                    content_hash = EXCLUDED.content_hash,
+                    text         = EXCLUDED.text,
+                    embedding    = EXCLUDED.embedding,
+                    metadata     = EXCLUDED.metadata,
+                    created_at   = EXCLUDED.created_at
                 """,
                 rows,
             )
@@ -206,6 +213,26 @@ class PgStore:
         if reindex:
             self.reindex_fts()
         return len(rows)
+
+    def prune_document(self, document_id: str, keep_ids: list[str]) -> int:
+        """Delete chunks of ``document_id`` whose id is NOT in ``keep_ids`` — the re-ingest sweep that
+        removes now-orphaned tail chunks / re-hashed content. Mirrors the DuckDB Store."""
+        keep = list(keep_ids)
+        with self.con.cursor() as cur:
+            if not keep:
+                cur.execute(f"SELECT count(*) FROM {self._qtable} WHERE document_id = %s", [document_id])
+                removed = int(cur.fetchone()[0])
+                cur.execute(f"DELETE FROM {self._qtable} WHERE document_id = %s", [document_id])
+            else:
+                cur.execute(
+                    f"SELECT count(*) FROM {self._qtable} "
+                    f"WHERE document_id = %s AND NOT (id = ANY(%s))", [document_id, keep])
+                removed = int(cur.fetchone()[0])
+                cur.execute(
+                    f"DELETE FROM {self._qtable} "
+                    f"WHERE document_id = %s AND NOT (id = ANY(%s))", [document_id, keep])
+        self.con.commit()
+        return removed
 
     def reindex_fts(self) -> None:
         """Post-bulk-load maintenance. tsvector is auto-maintained by the
@@ -257,7 +284,7 @@ class PgStore:
         with self.con.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT id, document_id, filename, chunk_index, text, metadata,
+                SELECT id, document_id, filename, chunk_index, content_hash, text, metadata,
                        created_at, (1 - (embedding <=> %s::vector)) AS sim
                 FROM {self._qtable}
                 WHERE (1 - (embedding <=> %s::vector)) >= %s {scope}
@@ -267,7 +294,7 @@ class PgStore:
                 params,
             )
             rows = cur.fetchall()
-        return [self._row(r, "similarity", r[7], "vector") for r in rows]
+        return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
                     document_ids: list | None = None) -> list[dict]:
@@ -286,7 +313,7 @@ class PgStore:
             with self.con.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, document_id, filename, chunk_index, text,
+                    SELECT id, document_id, filename, chunk_index, content_hash, text,
                            metadata, created_at,
                            ts_rank_cd(text_tsv,
                                       plainto_tsquery('english', %s)) AS score
@@ -300,11 +327,11 @@ class PgStore:
                 rows = cur.fetchall()
         except Exception:
             return []
-        return [self._row(r, "bm25_score", r[7], "bm25") for r in rows]
+        return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
 
     @staticmethod
     def _row(r, score_key: str, score_val, source: str) -> dict:
-        md = r[5]
+        md = r[6]
         if isinstance(md, str):
             try:
                 md = json.loads(md)
@@ -315,9 +342,10 @@ class PgStore:
             "document_id": r[1],
             "filename": r[2],
             "chunk_index": r[3],
-            "text": r[4],
+            "content_hash": r[4],
+            "text": r[5],
             "metadata": md or {},
-            "created_at": r[6],
+            "created_at": r[7],
             score_key: float(score_val) if score_val is not None else 0.0,
             "source_type": source,
         }

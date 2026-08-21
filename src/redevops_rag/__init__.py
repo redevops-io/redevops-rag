@@ -15,7 +15,7 @@ __all__ = ["RAG", "Store", "open_store", "PgStore", "open_pg_store", "Embedder",
            "NemoRetrieverEmbedder", "NemoRetrieverReranker", "make_embedder", "make_embedder_for",
            "encoder_for", "hybrid_search", "diver_search", "rrf_fuse", "TemporalReasoningRetriever",
            "ReasonIREmbedder", "ColVisionEmbedder", "MaxSimStore", "maxsim_score"]
-__version__ = "0.3.0"
+__version__ = "0.2.0"
 
 
 def __getattr__(name):
