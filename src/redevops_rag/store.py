@@ -66,12 +66,19 @@ class Store:
                     document_id VARCHAR,
                     filename VARCHAR,
                     chunk_index INTEGER,
+                    content_hash VARCHAR,
                     text VARCHAR,
                     embedding FLOAT[{self.dim}],
                     metadata VARCHAR,
                     created_at TIMESTAMP
                 )"""
         )
+        # Migrate a legacy corpus (built before content-addressed identity) in place — add the
+        # content_hash column if the table predates it, so old indexes reopen without a rebuild.
+        try:
+            self.con.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_hash VARCHAR")
+        except Exception:
+            pass
         # key/value index metadata — records which ENCODER built the index so query-time can
         # reconstruct the same one (encoder routing is a static per-index binding; a mismatched
         # query encoder silently returns garbage against these vectors). See open_store / set_meta.
@@ -98,18 +105,44 @@ class Store:
     def add_chunks(self, chunks: list[dict[str, Any]], reindex: bool = False) -> int:
         rows = []
         for c in chunks:
+            # Prefer a content-addressed id (ingest mints `{document_ref}::{content_hash[:16]}`); fall
+            # back to a random id only for callers that pass neither. Position-based ids are retired.
             cid = c.get("id") or str(uuid.uuid4())
             rows.append((
                 cid, c.get("document_id"), c.get("filename"), int(c.get("chunk_index", 0)),
-                c["text"], c["embedding"], json.dumps(c.get("metadata") or {}),
+                c.get("content_hash"), c["text"], c["embedding"],
+                json.dumps(c.get("metadata") or {}),
                 c.get("created_at") or datetime.now(timezone.utc),
             ))
         self.con.executemany(
-            "INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?,?,?)", rows
+            "INSERT OR REPLACE INTO chunks "
+            "(id, document_id, filename, chunk_index, content_hash, text, embedding, metadata, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", rows
         )
         if reindex:
             self.reindex_fts()
         return len(rows)
+
+    def prune_document(self, document_id: str, keep_ids: list[str]) -> int:
+        """Delete chunks of ``document_id`` whose id is NOT in ``keep_ids`` — the re-ingest sweep that
+        removes now-orphaned tail chunks (a source that shrank) and content that changed to a new id.
+        Content-addressed ids make re-ingest add the new chunks; this removes the stale ones, so the
+        index never silently keeps a vector that no longer matches current source content."""
+        keep = list(keep_ids)
+        # Count first, then delete — DuckDB's DELETE rowcount isn't reliable, so count gives the caller
+        # an accurate orphan count. Empty keep set ⇒ delete every chunk for the document.
+        if not keep:
+            removed = self.con.execute(
+                "SELECT count(*) FROM chunks WHERE document_id = ?", [document_id]).fetchone()[0]
+            self.con.execute("DELETE FROM chunks WHERE document_id = ?", [document_id])
+            return int(removed)
+        removed = self.con.execute(
+            "SELECT count(*) FROM chunks WHERE document_id = ? AND id NOT IN "
+            "(SELECT unnest(?::VARCHAR[]))", [document_id, keep]).fetchone()[0]
+        self.con.execute(
+            "DELETE FROM chunks WHERE document_id = ? AND id NOT IN "
+            "(SELECT unnest(?::VARCHAR[]))", [document_id, keep])
+        return int(removed)
 
     def reindex_fts(self) -> None:
         if not self._fts:
@@ -151,7 +184,7 @@ class Store:
             params.append(list(document_ids))
         params.append(int(top_k))
         rows = self.con.execute(
-            f"""SELECT id, document_id, filename, chunk_index, text, metadata, created_at, sim
+            f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, sim
                 FROM (
                     SELECT *, array_cosine_similarity(embedding, ?::FLOAT[{self.dim}]) AS sim
                     FROM chunks
@@ -159,7 +192,7 @@ class Store:
                 WHERE sim >= ? {scope}ORDER BY sim DESC LIMIT ?""",
             params,
         ).fetchall()
-        return [self._row(r, "similarity", r[7], "vector") for r in rows]
+        return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
                     document_ids: list | None = None) -> list[dict]:
@@ -173,7 +206,7 @@ class Store:
         params.append(int(limit))
         try:
             rows = self.con.execute(
-                f"""SELECT id, document_id, filename, chunk_index, text, metadata, created_at, score
+                f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, score
                    FROM (
                        SELECT *, fts_main_chunks.match_bm25(id, ?) AS score FROM chunks
                    )
@@ -182,13 +215,14 @@ class Store:
             ).fetchall()
         except Exception:
             return []
-        return [self._row(r, "bm25_score", r[7], "bm25") for r in rows]
+        return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
 
     @staticmethod
     def _row(r, score_key: str, score_val, source: str) -> dict:
         return {
             "chunk_id": r[0], "document_id": r[1], "filename": r[2], "chunk_index": r[3],
-            "text": r[4], "metadata": json.loads(r[5]) if r[5] else {}, "created_at": r[6],
+            "content_hash": r[4], "text": r[5], "metadata": json.loads(r[6]) if r[6] else {},
+            "created_at": r[7],
             score_key: float(score_val) if score_val is not None else 0.0,
             "source_type": source,
         }
