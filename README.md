@@ -57,7 +57,7 @@ redevops-rag ask "summarize our on-call runbook"
 from redevops_rag import RAG
 
 rag = RAG(db_path="vault.duckdb")          # add use_reranker=True for the cross-encoder stage
-rag.index("~/obsidian-vault")              # chunk + embed + index (incremental: re-run anytime)
+rag.index("~/obsidian-vault")              # chunk + embed + index (content-addressed ids; re-run anytime)
 hits = rag.search("zero-downtime deploys", k=8)
 # answer = rag.ask("zero-downtime deploys")["answer"]   # if an LLM env is set
 ```
@@ -77,8 +77,13 @@ small — those belong in **git**, not in a RAG.
 | `REDEVOPS_RAG_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | cross-encoder for `--rerank` |
 | `REDEVOPS_RAG_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | — | OpenAI-compatible endpoint for `ask` |
 
-> Status: **v0.1, not yet large-corpus benchmarked.** The retrieval logic is a faithful port
-> of the production pipeline; the packaging/CLI are new. Validate on your own data.
+**Content-addressed chunk identity.** Chunk ids are content-hash derived (`{document_ref}::{content_hash[:16]}`),
+not position-based — identical content yields identical ids regardless of ingest order, and re-ingesting an
+edited source is orphan-safe: a `content_hash` column is stored and a re-ingest sweep prunes chunks whose
+content no longer exists, so no stale vector survives a shrunk or edited document.
+
+> Status: **not yet large-corpus benchmarked.** The retrieval logic is a faithful port of the production
+> pipeline; the packaging/CLI are new. Validate on your own data.
 
 ## Architecture
 
