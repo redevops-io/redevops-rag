@@ -91,6 +91,9 @@ def hybrid_search(
     reranker: Optional["Reranker"] = None,  # noqa: F821
     document_ids: list | None = None,
     query_mode: str = "auto",
+    current_only: bool = False,
+    source_version: str | None = None,
+    as_of: str | None = None,
 ) -> list[dict[str, Any]]:
     """Vector + BM25 → RRF → recency/keyword boosts → optional cross-encoder rerank.
 
@@ -99,16 +102,21 @@ def hybrid_search(
     search to a document subset — used to build graduated-pollution candidate pools.
     ``query_mode`` controls the vector leg's query encoding for asymmetric encoders
     (``instruct``/``plain``/``auto``) — inert for a symmetric encoder like bge.
+
+    Evidence-version filters (all default off → legacy behavior unchanged): ``current_only``
+    restricts to the live projection, ``source_version`` pins an exact revision, and ``as_of``
+    selects the point-in-time view (evidence observed at/before a timestamp).
     """
     if not query or not query.strip():
         return []
+    _vf = dict(current_only=current_only, source_version=source_version, as_of=as_of)
     try:
         vector_hits = store.semantic_search(query, top_k=pool, threshold=vector_threshold,
-                                            document_ids=document_ids, query_mode=query_mode)
+                                            document_ids=document_ids, query_mode=query_mode, **_vf)
     except Exception:
         vector_hits = []
     try:
-        bm25_hits = store.bm25_search(query, limit=pool, document_ids=document_ids)
+        bm25_hits = store.bm25_search(query, limit=pool, document_ids=document_ids, **_vf)
     except Exception:
         bm25_hits = []
     if not vector_hits and not bm25_hits:

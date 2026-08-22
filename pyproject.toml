@@ -11,6 +11,10 @@ dependencies = [
     "duckdb>=1.1",
     "numpy>=1.24",
     "sentence-transformers>=2.6",
+    # Canonical evidence identity (rcv1 EvidenceRef/lineage) — retrieval hits carry source
+    # identity/version/content-hash so the revision→chunk→EvidenceRef chain survives into
+    # Discovery/Mission and point-in-time replay (v0.2.x evidence-native stabilization).
+    "runtime-contracts @ git+https://github.com/redevops-io/runtime-contracts.git@v0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +40,10 @@ build-backend = "hatchling.build"
 # redevops_rag.__version__ can never drift (they previously disagreed: 0.1.0 vs 0.2.0).
 [tool.hatch.version]
 path = "src/redevops_rag/__init__.py"
+
+[tool.hatch.metadata]
+# runtime-contracts is pinned by git ref (not yet on PyPI); allow the direct reference.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/redevops_rag"]

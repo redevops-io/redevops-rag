@@ -14,8 +14,10 @@ from .store import Store, open_store
 __all__ = ["RAG", "Store", "open_store", "PgStore", "open_pg_store", "Embedder", "NemotronEmbedder",
            "NemoRetrieverEmbedder", "NemoRetrieverReranker", "make_embedder", "make_embedder_for",
            "encoder_for", "hybrid_search", "diver_search", "rrf_fuse", "TemporalReasoningRetriever",
-           "ReasonIREmbedder", "ColVisionEmbedder", "MaxSimStore", "maxsim_score"]
-__version__ = "0.2.0"
+           "ReasonIREmbedder", "ColVisionEmbedder", "MaxSimStore", "maxsim_score",
+           "EvidenceRevision", "ingest_revision", "source_evidence_ref", "chunk_evidence_ref",
+           "chunk_lineage", "evidence_ref_from_hit"]
+__version__ = "0.2.1"
 
 
 def __getattr__(name):
@@ -37,4 +39,9 @@ def __getattr__(name):
     if name == "NemoRetrieverReranker":
         from .rerank import NemoRetrieverReranker
         return NemoRetrieverReranker
+    if name in ("EvidenceRevision", "ingest_revision", "source_evidence_ref",
+                "chunk_evidence_ref", "chunk_lineage", "evidence_ref_from_hit"):
+        # Lazy: the evidence path imports runtime-contracts only when actually used.
+        from . import evidence
+        return getattr(evidence, name)
     raise AttributeError(name)
