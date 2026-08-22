@@ -70,15 +70,30 @@ class Store:
                     text VARCHAR,
                     embedding FLOAT[{self.dim}],
                     metadata VARCHAR,
-                    created_at TIMESTAMP
+                    created_at TIMESTAMP,
+                    source_ref VARCHAR,
+                    source_version VARCHAR,
+                    source_content_hash VARCHAR,
+                    observed_at VARCHAR,
+                    superseded_by VARCHAR
                 )"""
         )
-        # Migrate a legacy corpus (built before content-addressed identity) in place — add the
-        # content_hash column if the table predates it, so old indexes reopen without a rebuild.
-        try:
-            self.con.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_hash VARCHAR")
-        except Exception:
-            pass
+        # Migrate a legacy corpus in place — add columns the table may predate, so old indexes reopen
+        # without a rebuild. content_hash: content-addressed identity. The source_*/observed_at/
+        # superseded_by columns: canonical evidence identity + version-aware retention (v0.2.x
+        # evidence-native seam). Legacy rows leave them NULL and behave exactly as before.
+        for col, typ in (
+            ("content_hash", "VARCHAR"),
+            ("source_ref", "VARCHAR"),
+            ("source_version", "VARCHAR"),
+            ("source_content_hash", "VARCHAR"),
+            ("observed_at", "VARCHAR"),
+            ("superseded_by", "VARCHAR"),
+        ):
+            try:
+                self.con.execute(f"ALTER TABLE chunks ADD COLUMN IF NOT EXISTS {col} {typ}")
+            except Exception:
+                pass
         # key/value index metadata — records which ENCODER built the index so query-time can
         # reconstruct the same one (encoder routing is a static per-index binding; a mismatched
         # query encoder silently returns garbage against these vectors). See open_store / set_meta.
@@ -113,15 +128,35 @@ class Store:
                 c.get("content_hash"), c["text"], c["embedding"],
                 json.dumps(c.get("metadata") or {}),
                 c.get("created_at") or datetime.now(timezone.utc),
+                # canonical evidence identity (NULL for legacy/base-path callers → unchanged behavior):
+                c.get("source_ref"), c.get("source_version"), c.get("source_content_hash"),
+                c.get("observed_at"), c.get("superseded_by"),
             ))
         self.con.executemany(
             "INSERT OR REPLACE INTO chunks "
-            "(id, document_id, filename, chunk_index, content_hash, text, embedding, metadata, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)", rows
+            "(id, document_id, filename, chunk_index, content_hash, text, embedding, metadata, created_at, "
+            "source_ref, source_version, source_content_hash, observed_at, superseded_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
         )
         if reindex:
             self.reindex_fts()
         return len(rows)
+
+    def supersede_source(self, source_ref: str, current_version: str) -> int:
+        """Mark every prior revision of ``source_ref`` as superseded by ``current_version``.
+
+        Version-aware retention: superseded chunks are *retained and still addressable* (by their
+        ``source_version`` or an as-of time) — they are not deleted — so point-in-time replay can
+        recover the exact historical evidence a past decision was bound to. Only rows whose
+        ``superseded_by`` is still NULL and whose version differs are updated. Returns the count.
+        """
+        removed = self.con.execute(
+            "SELECT count(*) FROM chunks WHERE source_ref = ? AND source_version != ? "
+            "AND superseded_by IS NULL", [source_ref, current_version]).fetchone()[0]
+        self.con.execute(
+            "UPDATE chunks SET superseded_by = ? WHERE source_ref = ? AND source_version != ? "
+            "AND superseded_by IS NULL", [current_version, source_ref, current_version])
+        return int(removed)
 
     def prune_document(self, document_id: str, keep_ids: list[str]) -> int:
         """Delete chunks of ``document_id`` whose id is NOT in ``keep_ids`` — the re-ingest sweep that
@@ -171,7 +206,9 @@ class Store:
         return self.embedder.encode([text])[0]
 
     def semantic_search(self, text: str, top_k: int = 50, threshold: float | None = None,
-                        document_ids: list | None = None, query_mode: str = "auto") -> list[dict]:
+                        document_ids: list | None = None, query_mode: str = "auto", *,
+                        current_only: bool = False, source_version: str | None = None,
+                        as_of: str | None = None) -> list[dict]:
         # threshold=None → the ENCODER's own sim_floor (bge 0.4; Nemotron/ReasonIR 0.1). A single global
         # 0.4 silently discards compressed-sim encoders' vector leg — bge stays byte-identical.
         if threshold is None:
@@ -182,9 +219,10 @@ class Store:
         if document_ids is not None:
             scope = "AND document_id = ANY(?::VARCHAR[]) "
             params.append(list(document_ids))
+        scope += self._version_scope(current_only, source_version, as_of, params)
         params.append(int(top_k))
         rows = self.con.execute(
-            f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, sim
+            f"""SELECT {self._COLS}, sim
                 FROM (
                     SELECT *, array_cosine_similarity(embedding, ?::FLOAT[{self.dim}]) AS sim
                     FROM chunks
@@ -192,10 +230,12 @@ class Store:
                 WHERE sim >= ? {scope}ORDER BY sim DESC LIMIT ?""",
             params,
         ).fetchall()
-        return [self._row(r, "similarity", r[8], "vector") for r in rows]
+        return [self._row(r, "similarity", r[13], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
-                    document_ids: list | None = None) -> list[dict]:
+                    document_ids: list | None = None, *,
+                    current_only: bool = False, source_version: str | None = None,
+                    as_of: str | None = None) -> list[dict]:
         if not self._fts or not text.strip():
             return []
         scope = ""
@@ -203,10 +243,11 @@ class Store:
         if document_ids is not None:
             scope = "AND document_id = ANY(?::VARCHAR[]) "
             params.append(list(document_ids))
+        scope += self._version_scope(current_only, source_version, as_of, params)
         params.append(int(limit))
         try:
             rows = self.con.execute(
-                f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, score
+                f"""SELECT {self._COLS}, score
                    FROM (
                        SELECT *, fts_main_chunks.match_bm25(id, ?) AS score FROM chunks
                    )
@@ -215,7 +256,11 @@ class Store:
             ).fetchall()
         except Exception:
             return []
-        return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
+        return [self._row(r, "bm25_score", r[13], "bm25") for r in rows]
+
+    #: SELECT column order shared by both retrieval legs; the score is appended after these.
+    _COLS = ("id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, "
+             "source_ref, source_version, source_content_hash, observed_at, superseded_by")
 
     @staticmethod
     def _row(r, score_key: str, score_val, source: str) -> dict:
@@ -223,9 +268,31 @@ class Store:
             "chunk_id": r[0], "document_id": r[1], "filename": r[2], "chunk_index": r[3],
             "content_hash": r[4], "text": r[5], "metadata": json.loads(r[6]) if r[6] else {},
             "created_at": r[7],
+            # canonical evidence identity — None on legacy hits, populated by the evidence path:
+            "source_ref": r[8], "source_version": r[9], "source_content_hash": r[10],
+            "observed_at": r[11], "superseded_by": r[12],
             score_key: float(score_val) if score_val is not None else 0.0,
             "source_type": source,
         }
+
+    @staticmethod
+    def _version_scope(current_only: bool, source_version, as_of, params: list) -> str:
+        """Build the optional evidence-version WHERE fragment (and append its params).
+
+        Defaults (all off) reproduce legacy behavior byte-for-byte. ``current_only`` restricts to the
+        live projection (``superseded_by IS NULL``); ``source_version`` pins an exact revision;
+        ``as_of`` selects revisions observed at/before a timestamp (point-in-time). These compose.
+        """
+        frag = ""
+        if current_only:
+            frag += "AND superseded_by IS NULL "
+        if source_version is not None:
+            frag += "AND source_version = ? "
+            params.append(source_version)
+        if as_of is not None:
+            frag += "AND (observed_at IS NULL OR observed_at <= ?) "
+            params.append(as_of)
+        return frag
 
     def count(self) -> int:
         return int(self.con.execute("SELECT count(*) FROM chunks").fetchone()[0])
