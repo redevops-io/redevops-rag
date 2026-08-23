@@ -110,15 +110,23 @@ def hybrid_search(
     if not query or not query.strip():
         return []
     _vf = dict(current_only=current_only, source_version=source_version, as_of=as_of)
-    try:
-        vector_hits = store.semantic_search(query, top_k=pool, threshold=vector_threshold,
-                                            document_ids=document_ids, query_mode=query_mode, **_vf)
-    except Exception:
-        vector_hits = []
-    try:
-        bm25_hits = store.bm25_search(query, limit=pool, document_ids=document_ids, **_vf)
-    except Exception:
-        bm25_hits = []
+
+    def _vector():
+        try:
+            return store.semantic_search(query, top_k=pool, threshold=vector_threshold,
+                                         document_ids=document_ids, query_mode=query_mode, **_vf)
+        except Exception:
+            return []
+
+    def _bm25():
+        try:
+            return store.bm25_search(query, limit=pool, document_ids=document_ids, **_vf)
+        except Exception:
+            return []
+
+    # independent legs (BM25 doesn't consume the query embedding) — overlap when REDEVOPS_RAG_CONCURRENCY>1
+    from ._parallel import run_parallel
+    vector_hits, bm25_hits = run_parallel([_vector, _bm25])
     if not vector_hits and not bm25_hits:
         return []
     fused = rrf_fuse([vector_hits, bm25_hits])
@@ -205,9 +213,18 @@ def diver_search(
                              recency_half_life_days=recency_half_life_days, reranker=reranker)
     cand: dict[Any, dict] = {}
     expanded = [(query, "instruct")] + [(s, "plain") for s in _expand_query(reason_llm, query, n_subqueries)]
-    for q, mode in expanded:
-        for h in hybrid_search(store, q, limit=pool, pool=pool, document_ids=document_ids,
-                               recency_half_life_days=recency_half_life_days, query_mode=mode):
+    # The N+1 sub-query retrievals are independent (unioned by _ID) — overlap them when
+    # REDEVOPS_RAG_CONCURRENCY>1; results are consumed in expanded order so first-occurrence dedup is
+    # identical to the serial path.
+    from ._parallel import run_parallel
+
+    def _fetch(qm):
+        q, mode = qm
+        return hybrid_search(store, q, limit=pool, pool=pool, document_ids=document_ids,
+                             recency_half_life_days=recency_half_life_days, query_mode=mode)
+
+    for hits in run_parallel([lambda qm=qm: _fetch(qm) for qm in expanded]):
+        for h in hits:
             cand.setdefault(_ID(h), h)
     candidates = list(cand.values())
     if reranker is not None and candidates:
