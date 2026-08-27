@@ -49,14 +49,33 @@ def make_client(model: str):
     return OpenAI(base_url=url, api_key="EMPTY", timeout=900), os.environ.get("QWEN_MODEL", "Qwen3.6-35B-A3B"), NOTHINK
 
 
-def build_store(emb, item):
+def build_store(emb, item, embeddings):
     from redevops_rag.store import Store
     ch = [dict(c) for c in item.chunks]
-    for c, e in zip(ch, emb.encode([c["text"] for c in ch])):
+    for c, e in zip(ch, embeddings):
         c["embedding"] = e
     s = Store(emb, ":memory:")
     s.add_chunks(ch, reindex=True)
     return s
+
+
+def build_enterprise_retriever(emb, store, item, embeddings, limit):
+    """The F4 `cr-enterprise` arm, if the enterprise overlay is importable. Builds a region index over
+    this item's chunks and wraps hybrid_search as the region-scoped backend. Returns None if CR-enterprise
+    is not installed — the arm is simply skipped (the harness runs on the AGPL stack alone)."""
+    try:
+        from context_runtime_enterprise.sparse_regions import RegionIndex, SparseRegionRetriever
+    except Exception:
+        return None
+    from redevops_rag.retrieve import hybrid_search
+    index = RegionIndex.build(item.chunks, embeddings)
+
+    def scoped_search(query, k, method, doc_ids):
+        return hybrid_search(store, query, limit=k, pool=max(50, k * 4), document_ids=doc_ids)
+
+    return SparseRegionRetriever(index, scoped_search, lambda q: emb.encode([q])[0],
+                                 top_regions=int(os.environ.get("TOP_REGIONS", "4")),
+                                 floor=float(os.environ.get("REGION_FLOOR", "0.15")))
 
 
 def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
@@ -74,12 +93,19 @@ def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
     print(f"{'horizon':>9} {'arm':<5} {'acc':>5} {'in_tok':>8} {'lat_s':>7}", flush=True)
     for H in horizons:
         item = build_item(articles, H, n_needles=n_needles, item_id=f"{corpus}-{H}", seed=seed)
-        store = build_store(emb, item)
-        for arm in ("full", "cr"):
+        embeddings = emb.encode([c["text"] for c in item.chunks])
+        store = build_store(emb, item, embeddings)
+        ent = build_enterprise_retriever(emb, store, item, embeddings, RETRIEVE_LIMIT)
+        arm_list = ["full", "cr"] + (["cr-enterprise"] if ent is not None else [])
+        for arm in arm_list:
             oks, toks, lats = [], [], []
             for nd in item.needles:
-                ctx = arms.ctx_full(item, WINDOW) if arm == "full" \
-                    else arms.ctx_cr(store, item, nd.question, limit=RETRIEVE_LIMIT)
+                if arm == "full":
+                    ctx = arms.ctx_full(item, WINDOW)
+                elif arm == "cr":
+                    ctx = arms.ctx_cr(store, item, nd.question, limit=RETRIEVE_LIMIT)
+                else:
+                    ctx = arms.ctx_cr_enterprise(ent, nd.question, limit=RETRIEVE_LIMIT)
                 t0 = time.perf_counter()
                 out = arms.answer_oracle(ctx, nd.question) if dry else \
                     arms.answer_llm(client, name, ctx, nd.question, extra_body=extra)
