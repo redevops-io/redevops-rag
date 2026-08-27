@@ -27,6 +27,16 @@ def ctx_cr(store, item: Item, query: str, *, limit: int = 8, pool: int = 50) -> 
     return "\n\n".join(h["text"] for h in hits)
 
 
+def ctx_cr_enterprise(retriever, query: str, *, limit: int = 8) -> str:
+    """Enterprise F4 arm: the sparse-region retriever narrows to top-K regions (deterministically, with a
+    confidence-floor→global fallback) before the same hybrid retrieval runs. `retriever` is a
+    context_runtime_enterprise.sparse_regions.SparseRegionRetriever; its `.search` returns store Hits."""
+    # F4 is identity-transparent: it returns whatever the underlying store search returned. This harness's
+    # backend is hybrid_search → dicts; a live runtime store → Hit objects. Read either.
+    hits = retriever.search(query, limit)
+    return "\n\n".join((h["text"] if isinstance(h, dict) else h.text) for h in hits)
+
+
 def answer_llm(client, model: str, ctx: str, question: str, *, extra_body=None,
                temperature: float = 0.0, max_tokens: int = 64) -> str:
     r = client.chat.completions.create(
