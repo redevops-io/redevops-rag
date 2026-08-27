@@ -327,11 +327,22 @@ def _judge_preflight():
                  f"corrupt accuracy.")
     print(f"[judge] preflight OK ({JUDGE_MODEL}): correct-probe pass, wrong-probe pass", flush=True)
 
+_CTXTRUNC = {"n": 0, "total": 0, "dropped_chars": 0}  # gold/oracle-context truncation counter (Run-2 bug guard)
+
 def ctx_of(texts, budget):
+    # cap = budget tokens → chars (~4 chars/tok). Truncating the *oracle* gold below its true size was the
+    # Run-2 eval bug (scored models on context they never saw). ORACLE_BUDGET=24000 now covers the largest
+    # known gold, but silence is what let the original artifact hide — so count and LOUDLY report any cut,
+    # turning a future budget regression into a visible warning instead of silently-wrong accuracy.
     out, cap, used = [], budget * 4, 0
+    full = sum(len(t) for t in texts)
     for t in texts:
         if used >= cap: break
         b = t[:cap - used]; out.append(b); used += len(b)
+    _CTXTRUNC["total"] += 1
+    if used < full:
+        _CTXTRUNC["n"] += 1
+        _CTXTRUNC["dropped_chars"] += full - used
     return "\n\n".join(out)
 
 _bge = Embedder(); _ri = None
@@ -475,6 +486,11 @@ for name in DATASETS:
 if _TRUNC["total"]:
     print(f"truncation: {_TRUNC['n']}/{_TRUNC['total']} completions hit max_tokens "
           f"({100*_TRUNC['n']/_TRUNC['total']:.1f}%) — raise THINK_BUDGET if high (lost final answers)", flush=True)
+if _CTXTRUNC["n"]:
+    print(f"CONTEXT TRUNCATION: {_CTXTRUNC['n']}/{_CTXTRUNC['total']} contexts exceeded their char cap "
+          f"({100*_CTXTRUNC['n']/_CTXTRUNC['total']:.1f}%, {_CTXTRUNC['dropped_chars']:,} chars dropped) — "
+          f"gold may be cut below what the model was scored on (the Run-2 eval bug). Raise ORACLE_BUDGET/"
+          f"DATASET_BUDGET; accuracy on truncated cells is NOT trustworthy.", flush=True)
 if _JUDGE["fails"]:
     print(f"judge: {_JUDGE['fails']}/{_JUDGE['calls']} judge call(s) failed after retries "
           f"({100*_JUDGE['fails']/max(1,_JUDGE['calls']):.1f}%) — those items were scored INCORRECT on a "
