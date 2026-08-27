@@ -13,3 +13,6 @@ example.duckdb
 benchmarks/results/*.err
 benchmarks/results/*.out
 *.duckdb
+
+# long-horizon harness: generated result cells (freeze deliberately as a control, do not auto-commit)
+benchmarks/results/longhorizon/

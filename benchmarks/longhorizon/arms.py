@@ -1,0 +1,52 @@
+"""Context-management arms + the fixed-window answerer call.
+
+`full` = feed the whole haystack truncated to the answerer's window (the baseline CR must beat).
+`cr`   = feed only the top-k chunks retrieved from the haystack (AGPL context management).
+The enterprise overlay slots in as a third arm by swapping the retriever; the answerer never changes.
+
+The answerer is a PLAIN fixed-window consumer (system prompt: answer only from context) — deliberately NOT
+a model that manages context itself, so the measured frontier is attributable to the arm, not the model.
+"""
+from __future__ import annotations
+
+from .tasks import TOK, Item
+
+SYSTEM = ("Answer using ONLY the provided context. Reply with the exact value and nothing else. "
+          "If the answer is not present in the context, reply exactly: NOT FOUND.")
+
+
+def ctx_full(item: Item, window_tokens: int) -> str:
+    """The whole haystack, truncated to the answerer's fixed window (chars ≈ tokens*4)."""
+    return item.haystack_text()[: window_tokens * TOK]
+
+
+def ctx_cr(store, item: Item, query: str, *, limit: int = 8, pool: int = 50) -> str:
+    """CR context management: retrieve the top-k chunks from THIS item's haystack only."""
+    from redevops_rag.retrieve import hybrid_search
+    hits = hybrid_search(store, query, limit=limit, pool=pool, document_ids=item.doc_ids)
+    return "\n\n".join(h["text"] for h in hits)
+
+
+def answer_llm(client, model: str, ctx: str, question: str, *, extra_body=None,
+               temperature: float = 0.0, max_tokens: int = 64) -> str:
+    r = client.chat.completions.create(
+        model=model, temperature=temperature, max_tokens=max_tokens, extra_body=extra_body or {},
+        messages=[{"role": "system", "content": SYSTEM},
+                  {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {question}\nAnswer:"}])
+    return (r.choices[0].message.content or "").strip()
+
+
+def answer_oracle(ctx: str, question: str) -> str:
+    """--dry answerer: no LLM. Returns the context so scoring measures whether the ARM actually delivered
+    the needle to the model — i.e. plumbing correctness (retrieval found it, truncation didn't drop it),
+    isolated from model quality."""
+    return ctx
+
+
+def scored(needle_answer: str, model_output: str) -> bool:
+    """Deterministic: the distinctive code appears in the output (case-insensitive substring)."""
+    return needle_answer.lower() in (model_output or "").lower()
+
+
+def est_tokens(text: str) -> int:
+    return len(text) // TOK
