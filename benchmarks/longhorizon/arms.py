@@ -37,13 +37,29 @@ def ctx_cr_enterprise(retriever, query: str, *, limit: int = 8) -> str:
     return "\n\n".join((h["text"] if isinstance(h, dict) else h.text) for h in hits)
 
 
-def answer_llm(client, model: str, ctx: str, question: str, *, extra_body=None,
-               temperature: float = 0.0, max_tokens: int = 64) -> str:
+def _complete(client, model, ctx, question, extra_body, temperature, max_tokens):
     r = client.chat.completions.create(
         model=model, temperature=temperature, max_tokens=max_tokens, extra_body=extra_body or {},
         messages=[{"role": "system", "content": SYSTEM},
                   {"role": "user", "content": f"Context:\n{ctx}\n\nQuestion: {question}\nAnswer:"}])
     return (r.choices[0].message.content or "").strip()
+
+
+def answer_llm(client, model: str, ctx: str, question: str, *, extra_body=None,
+               temperature: float = 0.0, max_tokens: int = 64) -> str:
+    # Real tokenizers pack fewer chars per token than the chars/4 estimate, and the ratio varies by corpus
+    # (strategywiki ~3.65, simplewiki ~3.40) — so a char-budgeted `full` context can still exceed the
+    # model's window. Rather than guess a corpus-specific margin, retry on the model's context-length
+    # rejection, trimming the context until it fits. Deterministic and corpus-agnostic.
+    for _ in range(4):
+        try:
+            return _complete(client, model, ctx, question, extra_body, temperature, max_tokens)
+        except Exception as e:
+            if "maximum context length" in str(e) or "context length" in str(e).lower():
+                ctx = ctx[: int(len(ctx) * 0.85)]        # trim 15% and retry
+                continue
+            raise
+    return _complete(client, model, ctx, question, extra_body, temperature, max_tokens)
 
 
 def answer_oracle(ctx: str, question: str) -> str:
