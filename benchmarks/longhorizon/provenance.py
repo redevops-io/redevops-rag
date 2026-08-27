@@ -78,16 +78,28 @@ def _schema() -> dict:
     return out
 
 
-# The implementation file behind each arm — the content hash of this file *is* the arm's identity.
+# The implementation module behind each arm — the content hash of that file *is* the arm's identity. The
+# modules were open-sourced into contextos (AGPL); the enterprise path is kept as a pre-migration fallback,
+# and provenance records whichever one actually resolved so a cell always names the code that ran.
 _ARM_IMPL = {
-    "cr-enterprise": ("sparse-regions", "context_runtime_enterprise.sparse_regions"),
-    "cr-materialize": ("materialization", "context_runtime_enterprise.materialization"),
+    "cr-enterprise": ("sparse-regions",
+                      ["context_runtime.adapters.sparse_regions", "context_runtime_enterprise.sparse_regions"]),
+    "cr-materialize": ("materialization",
+                       ["context_runtime.optimizer.materialization", "context_runtime_enterprise.materialization"]),
 }
 
 
+def _resolve(modnames: list[str]) -> tuple[str | None, Path | None]:
+    for name in modnames:
+        f = _module_file(name)
+        if f is not None:
+            return name, f
+    return None, None
+
+
 def capture(arms_active: list[str]) -> dict:
-    """Provenance for a run using ``arms_active``. Enterprise repo/arm entries appear only when an enterprise
-    arm actually ran, so an AGPL-only run is not mislabelled as carrying enterprise code."""
+    """Provenance for a run using ``arms_active``. The enterprise repo entry appears only if an arm actually
+    resolved from the enterprise overlay, so an AGPL run is never mislabelled as carrying enterprise code."""
     harness_dir = Path(__file__).resolve().parent
     prov: dict = {
         "harness": _repo_prov(_repo_of(harness_dir), harness_dir),
@@ -95,12 +107,16 @@ def capture(arms_active: list[str]) -> dict:
         "schema": _schema(),
         "arms": {},
     }
-    if any(a in _ARM_IMPL for a in arms_active):
-        prov["enterprise"] = _repo_prov(_repo_of(_module_file("context_runtime_enterprise")))
+    from_enterprise = False
     for arm in arms_active:
         if arm in _ARM_IMPL:
-            impl, modname = _ARM_IMPL[arm]
-            prov["arms"][arm] = {"impl": impl, "src_sha256": _sha256(_module_file(modname))}
+            impl, candidates = _ARM_IMPL[arm]
+            resolved, f = _resolve(candidates)
+            prov["arms"][arm] = {"impl": impl, "module": resolved, "src_sha256": _sha256(f)}
+            if resolved and resolved.startswith("context_runtime_enterprise"):
+                from_enterprise = True
+    if from_enterprise:
+        prov["enterprise"] = _repo_prov(_repo_of(_module_file("context_runtime_enterprise")))
     return prov
 
 

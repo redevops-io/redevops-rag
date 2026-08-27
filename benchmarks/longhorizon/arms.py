@@ -1,8 +1,9 @@
 """Context-management arms + the fixed-window answerer call.
 
 `full` = feed the whole haystack truncated to the answerer's window (the baseline CR must beat).
-`cr`   = feed only the top-k chunks retrieved from the haystack (AGPL context management).
-The enterprise overlay slots in as a third arm by swapping the retriever; the answerer never changes.
+`cr`   = feed only the top-k chunks retrieved from the haystack (global retrieval).
+`cr-enterprise`/`cr-materialize` swap in the F4/F2 optimizations (now in the AGPL core); the answerer
+never changes. The arm labels predate the open-sourcing and are kept for result continuity.
 
 The answerer is a PLAIN fixed-window consumer (system prompt: answer only from context) — deliberately NOT
 a model that manages context itself, so the measured frontier is attributable to the arm, not the model.
@@ -28,9 +29,9 @@ def ctx_cr(store, item: Item, query: str, *, limit: int = 8, pool: int = 50) -> 
 
 
 def ctx_cr_enterprise(retriever, query: str, *, limit: int = 8) -> str:
-    """Enterprise F4 arm: the sparse-region retriever narrows to top-K regions (deterministically, with a
-    confidence-floor→global fallback) before the same hybrid retrieval runs. `retriever` is a
-    context_runtime_enterprise.sparse_regions.SparseRegionRetriever; its `.search` returns store Hits."""
+    """F4 arm: the sparse-region retriever narrows to top-K regions (deterministically, with a
+    confidence-floor→scoped fallback) before the same hybrid retrieval runs. `retriever` is a
+    context_runtime.adapters.sparse_regions.SparseRegionRetriever; its `.search` returns store Hits."""
     # F4 is identity-transparent: it returns whatever the underlying store search returned. This harness's
     # backend is hybrid_search → dicts; a live runtime store → Hit objects. Read either.
     hits = retriever.search(query, limit)

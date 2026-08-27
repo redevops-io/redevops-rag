@@ -74,9 +74,12 @@ def build_enterprise_retriever(emb, store, item, embeddings, limit):
     this item's chunks and wraps hybrid_search as the region-scoped backend. Returns None if CR-enterprise
     is not installed — the arm is simply skipped (the harness runs on the AGPL stack alone)."""
     try:
-        from context_runtime_enterprise.sparse_regions import RegionIndex, SparseRegionRetriever
+        from context_runtime.adapters.sparse_regions import RegionIndex, SparseRegionRetriever
     except Exception:
-        return None
+        try:  # pre-migration fallback: the module lived in the enterprise overlay
+            from context_runtime_enterprise.sparse_regions import RegionIndex, SparseRegionRetriever
+        except Exception:
+            return None
     from redevops_rag.retrieve import hybrid_search
     index = RegionIndex.build(item.chunks, embeddings)
 
@@ -91,12 +94,20 @@ def build_enterprise_retriever(emb, store, item, embeddings, limit):
 STATE_TOKENS = int(os.environ.get("STATE_TOKENS", "500"))   # the STATE_ONLY depth's tiny state window
 
 
-def f2_available():
+def _materialization_mod():
     try:
-        import context_runtime_enterprise.materialization  # noqa: F401
-        return True
+        import context_runtime.optimizer.materialization as m  # noqa: F401
+        return m
     except Exception:
-        return False
+        try:
+            import context_runtime_enterprise.materialization as m  # noqa: F401
+            return m
+        except Exception:
+            return None
+
+
+def f2_available():
+    return _materialization_mod() is not None
 
 
 def f2_materialize(nd, item, store, ent, limit):
@@ -105,7 +116,8 @@ def f2_materialize(nd, item, store, ent, limit):
     names. That is a confidence signal (did we retrieve the relevant evidence), NOT the gold value, so the
     ladder does not peek at the answer. Lazy: only depths up to the chosen one are actually retrieved, so
     the cost is the cheapest sufficient depth's — the whole point of F2."""
-    from context_runtime_enterprise.materialization import Depth, MaterializationLadder
+    m = _materialization_mod()
+    Depth, MaterializationLadder = m.Depth, m.MaterializationLadder
     key = nd.key.lower()
     built: dict = {}
 
