@@ -34,7 +34,16 @@ from longhorizon import provenance                      # noqa: E402
 
 RES = Path(os.environ.get("OUT", _HERE.parent / "results" / "longhorizon"))
 WINDOW = int(os.environ.get("WINDOW", "32000"))         # answerer's fixed context window (tokens)
+# The `full` arm's INPUT must leave room for the answer + prompt scaffolding, or a real model rejects the
+# request at the window boundary (input+output > max_model_len). It must also absorb the gap between the
+# chars/4 token estimate and the real tokenizer (empirically ~3.9 chars/tok on wiki text, i.e. denser), so
+# a chars/4 budget slightly under-reserves. An 8% margin covers both, letting WINDOW be the true window.
+def _full_input_budget() -> int:
+    return int(WINDOW * 0.85) - ANSWER_MAX_TOKENS
 RETRIEVE_LIMIT = int(os.environ.get("RETRIEVE_LIMIT", "8"))   # cr arm top-k (a knob CR itself optimizes)
+# Answerer token budget. Higher than the old 64 so a reasoning answerer (e.g. Nemotron) that emits some
+# thinking still reaches the short factual answer — scoring is a substring match, so extra tokens are safe.
+ANSWER_MAX_TOKENS = int(os.environ.get("ANSWER_MAX_TOKENS", "256"))
 NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
@@ -65,9 +74,12 @@ def build_enterprise_retriever(emb, store, item, embeddings, limit):
     this item's chunks and wraps hybrid_search as the region-scoped backend. Returns None if CR-enterprise
     is not installed — the arm is simply skipped (the harness runs on the AGPL stack alone)."""
     try:
-        from context_runtime_enterprise.sparse_regions import RegionIndex, SparseRegionRetriever
+        from context_runtime.adapters.sparse_regions import RegionIndex, SparseRegionRetriever
     except Exception:
-        return None
+        try:  # pre-migration fallback: the module lived in the enterprise overlay
+            from context_runtime_enterprise.sparse_regions import RegionIndex, SparseRegionRetriever
+        except Exception:
+            return None
     from redevops_rag.retrieve import hybrid_search
     index = RegionIndex.build(item.chunks, embeddings)
 
@@ -82,12 +94,20 @@ def build_enterprise_retriever(emb, store, item, embeddings, limit):
 STATE_TOKENS = int(os.environ.get("STATE_TOKENS", "500"))   # the STATE_ONLY depth's tiny state window
 
 
-def f2_available():
+def _materialization_mod():
     try:
-        import context_runtime_enterprise.materialization  # noqa: F401
-        return True
+        import context_runtime.optimizer.materialization as m  # noqa: F401
+        return m
     except Exception:
-        return False
+        try:
+            import context_runtime_enterprise.materialization as m  # noqa: F401
+            return m
+        except Exception:
+            return None
+
+
+def f2_available():
+    return _materialization_mod() is not None
 
 
 def f2_materialize(nd, item, store, ent, limit):
@@ -96,7 +116,8 @@ def f2_materialize(nd, item, store, ent, limit):
     names. That is a confidence signal (did we retrieve the relevant evidence), NOT the gold value, so the
     ladder does not peek at the answer. Lazy: only depths up to the chosen one are actually retrieved, so
     the cost is the cheapest sufficient depth's — the whole point of F2."""
-    from context_runtime_enterprise.materialization import Depth, MaterializationLadder
+    m = _materialization_mod()
+    Depth, MaterializationLadder = m.Depth, m.MaterializationLadder
     key = nd.key.lower()
     built: dict = {}
 
@@ -114,7 +135,7 @@ def f2_materialize(nd, item, store, ent, limit):
     choice = MaterializationLadder().select("hybrid:local", probes)
     ctx = built.get(choice.depth)
     if ctx is None:                                  # FULL_CONTEXT (ceiling): materialize the whole window
-        ctx = arms.ctx_full(item, WINDOW)
+        ctx = arms.ctx_full(item, _full_input_budget())
     return ctx, choice.depth.label
 
 
@@ -149,7 +170,7 @@ def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
             oks, toks, lats, depths = [], [], [], []
             for nd in item.needles:
                 if arm == "full":
-                    ctx = arms.ctx_full(item, WINDOW)
+                    ctx = arms.ctx_full(item, _full_input_budget())
                 elif arm == "cr":
                     ctx = arms.ctx_cr(store, item, nd.question, limit=RETRIEVE_LIMIT)
                 elif arm == "cr-enterprise":
@@ -159,7 +180,8 @@ def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
                     depths.append(depth)
                 t0 = time.perf_counter()
                 out = arms.answer_oracle(ctx, nd.question) if dry else \
-                    arms.answer_llm(client, name, ctx, nd.question, extra_body=extra)
+                    arms.answer_llm(client, name, ctx, nd.question, extra_body=extra,
+                                    max_tokens=ANSWER_MAX_TOKENS)
                 lats.append(time.perf_counter() - t0)
                 oks.append(arms.scored(nd.answer, out))
                 toks.append(arms.est_tokens(ctx))
