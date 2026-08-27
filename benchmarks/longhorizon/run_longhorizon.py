@@ -30,6 +30,7 @@ sys.path.insert(0, str(_REPO / "benchmarks"))   # package-relative imports below
 from longhorizon.corpus import load_articles            # noqa: E402
 from longhorizon.tasks import build_item                # noqa: E402
 from longhorizon import arms                            # noqa: E402
+from longhorizon import provenance                      # noqa: E402
 
 RES = Path(os.environ.get("OUT", _HERE.parent / "results" / "longhorizon"))
 WINDOW = int(os.environ.get("WINDOW", "32000"))         # answerer's fixed context window (tokens)
@@ -130,6 +131,7 @@ def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
         client, name, extra = make_client(model)
 
     print(f"{'horizon':>9} {'arm':<14} {'acc':>5} {'in_tok':>8} {'lat_s':>7}", flush=True)
+    prov = None
     for H in horizons:
         item = build_item(articles, H, n_needles=n_needles, item_id=f"{corpus}-{H}", seed=seed)
         embeddings = emb.encode([c["text"] for c in item.chunks])
@@ -140,6 +142,9 @@ def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
             arm_list.append("cr-enterprise")
             if f2_available():
                 arm_list.append("cr-materialize")
+        if prov is None:   # capture once — same code runs across horizons; stamp it into every cell
+            prov = provenance.capture(arm_list)
+            print(f"[provenance] {provenance.one_line(prov)}", flush=True)
         for arm in arm_list:
             oks, toks, lats, depths = [], [], [], []
             for nd in item.needles:
@@ -166,6 +171,7 @@ def run(horizons, n_needles, model, dry, corpus, dump, seed, limit):
                     "est_haystack_tokens": item.est_tokens}
             if depths:   # F2: which materialization depths the ladder chose across the needles
                 cell["depth_dist"] = {d: depths.count(d) for d in sorted(set(depths))}
+            cell["provenance"] = prov   # self-describing: which code produced this cell
             tag = "dry" if dry else name
             (RES / f"{corpus}__{arm}__{H}__{tag}.json").write_text(json.dumps(cell, indent=2))
             extra_col = f"  depths={cell['depth_dist']}" if depths else ""
