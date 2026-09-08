@@ -14,7 +14,9 @@ from .store import Store, open_store
 __all__ = ["RAG", "Store", "open_store", "PgStore", "open_pg_store", "Embedder", "NemotronEmbedder",
            "NemoRetrieverEmbedder", "NemoRetrieverReranker", "make_embedder", "make_embedder_for",
            "encoder_for", "hybrid_search", "diver_search", "rrf_fuse", "TemporalReasoningRetriever",
-           "ReasonIREmbedder", "ColVisionEmbedder", "MaxSimStore", "maxsim_score"]
+           "ReasonIREmbedder", "ColVisionEmbedder", "MaxSimStore", "maxsim_score",
+           "ChangeClosureGraph", "Node", "citation_closure", "citation_graph_retrieve",
+           "graph_union_retrieve", "PrecisionEdgeExtractor", "openai_chat_fn"]
 __version__ = "0.2.0"
 
 
@@ -37,4 +39,10 @@ def __getattr__(name):
     if name == "NemoRetrieverReranker":
         from .rerank import NemoRetrieverReranker
         return NemoRetrieverReranker
+    if name in ("ChangeClosureGraph", "Node", "citation_closure", "citation_graph_retrieve",
+                "graph_union_retrieve", "PrecisionEdgeExtractor", "openai_chat_fn"):
+        # Lazy: the structural change-closure primitive is pure-Python + stdlib-only, kept out of the
+        # import path so `import redevops_rag` stays light and free of the content-retrieval stack.
+        from . import citation_graph
+        return getattr(citation_graph, name)
     raise AttributeError(name)
