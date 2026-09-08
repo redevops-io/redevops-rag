@@ -32,6 +32,9 @@ query
                     └─ (optional) cross-encoder rerank  BAAI/bge-reranker-v2-m3  → top-k
 ```
 
+For **change-closure** retrieval (the set affected by an edit, not the set resembling a query) there is a
+separate structural arm, `citation_graph`, that composes with this pipeline — see below.
+
 ## Install
 
 Not on PyPI yet — install from git:
@@ -71,6 +74,40 @@ rag.index("~/obsidian-vault")              # chunk + embed + index (content-addr
 hits = rag.search("zero-downtime deploys", k=8)
 # answer = rag.ask("zero-downtime deploys")["answer"]   # if an LLM env is set
 ```
+
+## Structural change-closure retrieval (`citation_graph`)
+
+Hybrid search finds what *resembles* a query. Some retrieval targets are **structural**, not lexical: the
+set of provisions/clauses/symbols affected by an **edit** is its *dependency closure* — everything that
+cites, incorporates, uses the defined term of, or calls the edited unit — and a dependent that shares no
+surface text with the edit is invisible to any similarity method. `citation_graph` is that structural
+primitive: a dependency graph with **reverse-closure** retrieval, composable with hybrid search under a
+token budget. It is pure-Python + stdlib-only (no torch/duckdb) and imported lazily.
+
+```python
+from redevops_rag import ChangeClosureGraph, Node
+
+g = ChangeClosureGraph(
+    nodes=[Node("s362", "automatic stay …"), Node("s541", "property of the estate is subject to §362 …")],
+    edges={"s541": {"s362"}},                      # s541 DEPENDS ON s362
+)
+g.closure("s362")                                  # {"s541", …} — who is affected if §362 is edited
+g.retrieve("s362", budget=4000)                    # closure, hop-ordered, budget-filled (the seed excluded)
+
+# compose with content retrieval: closure first, a hybrid ranking fills the remaining budget
+content = [h["chunk_id"] for h in rag.search(edited_text, k=50)]
+g.union_retrieve("s362", budget=4000, content_order=content)
+```
+
+Measured against BM25 / dense / HippoRAG-style PageRank at a matched 4000-token budget, `citation_graph`
+wins or ties on **every** case across statutes (0.556 vs 0.159), regulations→statutes (0.484 vs 0.066),
+real contracts (0.302 vs 0.209) and defined-terms (1.000 vs 0.206) — see
+[redevops-benchmarks change-closure](https://github.com/redevops-io/redevops-benchmarks) and
+[redevops.io/blog](https://redevops.io/blog). The ceiling is **edge coverage**; where genuinely-implicit
+edges have no parseable reference, `PrecisionEdgeExtractor` recovers them from an injectable LLM —
+precision-gated (confidence + verbatim-trigger grounding) so the edges *help* the closure rather than
+bloat it, and fail-soft when no endpoint is reachable. *Which* representation (graph, content, or their
+union) to spend the budget on for a given task is a Context-Runtime decision, not a fixed retriever.
 
 ## Why a folder, not a sync
 
