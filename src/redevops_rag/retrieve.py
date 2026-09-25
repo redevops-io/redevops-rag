@@ -16,17 +16,21 @@ if TYPE_CHECKING:  # avoid importing duckdb just to type-hint
 
 
 def rrf_fuse(rankings: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, Any]]:
-    """Reciprocal-rank-fusion: ``score = Σ 1 / (k + rank)`` over each input ranking.
+    """Reciprocal-rank-fusion: ``score = Σ 1 / (k + rank + 1)`` over each input ranking.
 
-    Keyed by ``chunk_id`` (falls back to ``filename::chunk_index``). Rank is 0-based, so
-    the top of each list contributes ``1/(k+0)``.
+    This is the canonical (Cormack) RRF, pinned as the cross-language golden oracle in
+    redevops-conformance (``fixtures/rrf_vectors.json``) and identical to contextos
+    ``scheduler.two_stage.rrf_fuse`` and context-runtime-go ``scheduler.RRFFuse``. Keyed by
+    ``chunk_id`` (falls back to ``filename::chunk_index``). Rank is 0-based, so the top of each list
+    contributes ``1/(k+1)``; scores round to 6dp. Ties keep stable first-seen order (dict insertion
+    order + stable sort). ``k`` is the fusion constant; top-k truncation is applied downstream.
     """
     scores: dict[str, float] = {}
     cache: dict[str, dict[str, Any]] = {}
     for ranking in rankings:
         for rank, item in enumerate(ranking):
             key = item.get("chunk_id") or f"{item.get('filename')}::{item.get('chunk_index')}"
-            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
             if key not in cache:
                 cache[key] = dict(item)
             else:
@@ -36,7 +40,7 @@ def rrf_fuse(rankings: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str
     out: list[dict[str, Any]] = []
     for key, score in ordered:
         row = cache[key]
-        row["rrf_score"] = score
+        row["rrf_score"] = round(score, 6)
         out.append(row)
     return out
 

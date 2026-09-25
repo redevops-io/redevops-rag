@@ -12,14 +12,14 @@ def test_rrf_rewards_agreement_and_rank():
     assert keys[0] in {"a", "b"} and keys[1] in {"a", "b"}
     assert keys.index("a") < keys.index("c")
     assert keys.index("b") < keys.index("d")
-    # RRF score for 'a' = 1/(60+0) + 1/(60+1).
+    # canonical RRF: 'a' at rank0 (list1) + rank1 (list2) = 1/(60+1) + 1/(60+2), rounded to 6dp.
     a = next(r for r in fused if r["chunk_id"] == "a")
-    assert abs(a["rrf_score"] - (1 / 60 + 1 / 61)) < 1e-9
+    assert a["rrf_score"] == round(1 / 61 + 1 / 62, 6)
 
 
 def test_rrf_falls_back_to_filename_key():
     fused = rrf_fuse([[{"filename": "x.md", "chunk_index": 3}]])
-    assert fused[0]["rrf_score"] == 1 / 60
+    assert fused[0]["rrf_score"] == round(1 / 61, 6)
 
 
 def test_chunker_packs_and_splits():
