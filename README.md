@@ -113,7 +113,7 @@ union) to spend the budget on for a given task is a Context-Runtime decision, no
 
 Point it at one **central** copy of the knowledge base and query it — you don't copy 200k
 files to every machine, you index once and retrieve. For a team, run it on one box (or behind
-a thin service) so everyone hits a single index. Configuration / skills / `CLAUDE.md` are
+a thin service) so everyone hits a single index. Configuration and skills files are
 small — those belong in **git**, not in a RAG.
 
 ## Configuration
