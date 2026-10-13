@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "Hybrid RAG (DuckDB vector + BM25 + RRF + recency/keyword priors + optional cross-encoder rerank) as an installable library + CLI."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "AGPL-3.0-or-later" }
+license = { text = "AGPL-3.0-or-later WITH Commons-Clause" }
 authors = [{ name = "redevops.io" }]
 keywords = ["rag", "retrieval", "hybrid-search", "bm25", "rrf", "reranker", "duckdb", "embeddings"]
 dependencies = [
