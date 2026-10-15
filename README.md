@@ -3,21 +3,26 @@
 [![License: AGPL-3.0 + Commons Clause](https://img.shields.io/badge/License-AGPL--3.0%20%2B%20Commons%20Clause-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg) [![NVIDIA Inception](https://img.shields.io/badge/NVIDIA-Inception%20Program%20Member-76B900.svg)](https://www.nvidia.com/en-us/startups/)
 &nbsp;·&nbsp; self-hosted &nbsp;·&nbsp; no lock-in &nbsp;·&nbsp; source-available
 
-> **🚀 NVIDIA Inception Program Member** — ReDevOps is a member of the NVIDIA Inception Program, supporting startups advancing AI and accelerated computing. Membership provides access to NVIDIA technology, technical resources, and the startup ecosystem. It does not imply product endorsement by NVIDIA.
+> **🚀 NVIDIA Inception Program Member** — ReDevOps is a member of the NVIDIA Inception Program, supporting startups advancing AI and accelerated computing. Membership provides access to NVIDIA technology, technical resources, and the startup ecosystem. It does not imply product endorsement by NVIDIA. Program membership is not product endorsement.
 
+- **What it does:** hybrid retrieval (DuckDB vector + BM25 + RRF, optional rerank) as a Python library and CLI, plus a pure-Python structural `citation_graph` change-closure primitive.
+- **Who it's for:** developers who want to index a folder (docs tree, repo, notes vault) and query it locally.
+- **Maturity:** alpha (0.x; see [STATUS.md](STATUS.md)).
+- **3-minute example:** [Install](#install) from git, then run [`examples/quickstart.py`](examples/quickstart.py) or the `redevops-rag index` / `search` commands in [CLI](#cli). Embedding models are downloaded on first use.
+- **Evidence:** [`benchmarks/`](benchmarks/) holds the retrieval eval scripts and `benchmarks/results/`; the `citation_graph` numbers below are *not* in this repo. Unit tests: `tests/`.
+- **Limitations:** see [STATUS.md](STATUS.md). Validate on your own data.
+- **Docs:** [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
 
-
-> **🚀 NVIDIA Inception Program Member** — ReDevOps is a member of the NVIDIA Inception Program, supporting startups advancing AI and accelerated computing. Membership provides access to NVIDIA technology, technical resources, and the startup ecosystem. It does not imply product endorsement by NVIDIA.
 
 Hybrid RAG as a small, installable library + CLI — **DuckDB vector + BM25 fused via
 Reciprocal Rank Fusion, recency & keyword priors, and an optional cross-encoder rerank.**
 
-It's the retrieval pipeline from [redevops-io/rag-saas-platform](https://github.com/redevops-io/rag-saas-platform)
+It's the retrieval pipeline from `redevops-io/rag-saas-platform` (a **private** repository, not publicly available)
 carved out of its multi-tenant SaaS shell (no Auth0/Stripe/Kubernetes/workspace coupling) so
 you can drop the *same* retrieval over any folder — a docs tree, a repo, an Obsidian vault —
 in three lines.
 
-> **Versioning — backwards-compatible across all five index/format generations (v1–v5).** (These `vN` are *architecture generations*, not release versions — releases are semver, e.g. `v0.2.0`.) The library API, CLI, and on-disk index/store format from every prior generation keep working — upgrade in place, no migration.
+> **Versioning — backwards-compatible across all five index/format generations (v1–v5).** (These `vN` are *architecture generations*, not release versions — releases are semver, e.g. `v0.2.0`.) **Version note:** the latest git tag is `v0.4.0`, but the package's `redevops_rag.__version__` (and therefore the installed wheel version) still reports `0.2.0`; this is a documentation note, tracked in [STATUS.md](STATUS.md). The library API, CLI, and on-disk index/store format from every prior generation keep working — upgrade in place, no migration.
 
 ## Pipeline
 
@@ -98,11 +103,12 @@ content = [h["chunk_id"] for h in rag.search(edited_text, k=50)]
 g.union_retrieve("s362", budget=4000, content_order=content)
 ```
 
-Measured against BM25 / dense / HippoRAG-style PageRank at a matched 4000-token budget, `citation_graph`
-wins or ties on **every** case across statutes (0.556 vs 0.159), regulations→statutes (0.484 vs 0.066),
-real contracts (0.302 vs 0.209) and defined-terms (1.000 vs 0.206) — see
-[redevops-benchmarks change-closure](https://github.com/redevops-io/redevops-benchmarks) and
-[redevops.io/blog](https://redevops.io/blog). The ceiling is **edge coverage**; where genuinely-implicit
+In ReDevOps' own benchmark runs, measured against BM25 / dense / HippoRAG-style PageRank at a matched 4000-token budget,
+`citation_graph` won or tied on every case across statutes (0.556 vs 0.159), regulations→statutes (0.484 vs 0.066),
+real contracts (0.302 vs 0.209) and defined-terms (1.000 vs 0.206). **Not reproducible from this repo:** these results
+live in a private repository (`redevops-benchmarks`, not public) and no script or result file in this repo regenerates them.
+Treat them as unverified by third parties; see the [blog](https://redevops.io/blog) for the write-up. The defined-terms
+1.000 is a ceiling value, and the benchmark set is not described in this repo. The ceiling is **edge coverage**; where genuinely-implicit
 edges have no parseable reference, `PrecisionEdgeExtractor` recovers them from an injectable LLM —
 precision-gated (confidence + verbatim-trigger grounding) so the edges *help* the closure rather than
 bloat it, and fail-soft when no endpoint is reachable. *Which* representation (graph, content, or their
@@ -141,3 +147,5 @@ contracts, while stores and providers sit behind small interfaces at the boundar
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 AGPL-3.0-or-later · redevops.io
+
+> Note: the repository's [`LICENSE.md`](LICENSE.md) is titled "License" and describes the project as "source-available, not open source in the OSI sense", licensed under AGPL-3.0-or-later "as modified by the Commons Clause License Condition v1.0". The one-line footer above omits the Commons Clause; it is under counsel review and the wording is intentionally unchanged here.
