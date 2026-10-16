@@ -36,12 +36,15 @@ representation dominates is domain-dependent (structure dominates statutes; cont
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
+
+from .namespace import check_namespace
 
 __all__ = [
     "Node", "ExtractedEdge", "ChangeClosureGraph",
@@ -106,8 +109,9 @@ def citation_closure(cited_by: dict[str, set[str]], seed: str, hops: int = 2) ->
 
 
 def _budget_fill(order: Iterable[str], tokens_of: dict[str, int], budget: int, exclude: str) -> list[str]:
-    """Take ids from ``order`` until the token budget is exhausted (small-node greedy within the given
-    order). ``exclude`` (the edited seed) and duplicates are skipped. Returns an ordered list."""
+    """Take ids from ``order`` while they fit the token budget (small-node greedy within the given order).
+    The total never exceeds ``budget``; an oversize node is skipped, not admitted. ``exclude`` (the edited
+    seed) and duplicates are skipped. Returns an ordered list."""
     out: list[str] = []
     spent = 0
     seen: set[str] = {exclude}
@@ -116,8 +120,8 @@ def _budget_fill(order: Iterable[str], tokens_of: dict[str, int], budget: int, e
             continue
         seen.add(nid)
         t = tokens_of.get(nid, 0)
-        if out and spent + t > budget:
-            break
+        if spent + t > budget:
+            continue  # too large for what is left; a smaller later node may still fit
         out.append(nid)
         spent += t
         if spent >= budget:
@@ -127,20 +131,22 @@ def _budget_fill(order: Iterable[str], tokens_of: dict[str, int], budget: int, e
 
 def _closure_order(cited_by: dict[str, set[str]], in_degree: dict[str, int],
                    seed: str, hops: int) -> list[str]:
-    """Reverse-citation traversal, hop-ordered (nearer citers first), in-degree desc as a tie-break so the
-    most structurally central affected nodes come first under a tight budget."""
+    """Reverse-citation traversal, hop-ordered (nearer citers first). Within a hop nodes are ordered by
+    in-degree desc then id, so the most structurally central affected nodes come first under a tight budget
+    and the result does not depend on set iteration order (hash seed)."""
     order: list[str] = []
     seen = {seed}
-    frontier = {seed}
+    frontier = [seed]
     for _ in range(max(0, hops)):
-        nxt: list[str] = []
-        for n in frontier:
-            for a in sorted(cited_by.get(n, ()), key=lambda x: -in_degree.get(x, 0)):
+        found: set[str] = set()
+        for n in sorted(frontier):
+            for a in cited_by.get(n, ()):
                 if a not in seen:
-                    seen.add(a)
-                    nxt.append(a)
+                    found.add(a)
+        nxt = sorted(found, key=lambda x: (-in_degree.get(x, 0), x))
+        seen.update(nxt)
         order.extend(nxt)
-        frontier = set(nxt)
+        frontier = nxt
         if not frontier:
             break
     return order
@@ -168,7 +174,9 @@ def graph_union_retrieve(graph: "ChangeClosureGraph", seed: str, budget: int, ho
     """
     order = _closure_order(graph.cited_by, graph._in_degree, seed, hops)
     if content_order:
-        order = list(dict.fromkeys([*order, *content_order]))
+        # ids the graph does not know have no token cost on record; admitting them would be free, so drop
+        known = [c for c in content_order if c in graph.tokens]
+        order = list(dict.fromkeys([*order, *known]))
     return _budget_fill(order, graph.tokens, budget, seed)
 
 
@@ -183,7 +191,9 @@ class ChangeClosureGraph:
     traversal/knapsack logic lives in the pure functions above.
     """
 
-    def __init__(self, nodes: Iterable[Node], edges: dict[str, Iterable[str]] | None = None):
+    def __init__(self, nodes: Iterable[Node], edges: dict[str, Iterable[str]] | None = None, *,
+                 namespace: Optional[str] = None):
+        self.namespace = namespace
         self.nodes: list[Node] = [
             n if n.tokens else Node(n.id, n.text, _estimate_tokens(n.text)) for n in nodes
         ]
@@ -212,11 +222,15 @@ class ChangeClosureGraph:
         return sum(len(v) for v in self.cites.values())
 
     # -- retrieval arms (delegate to the pure core) --
-    def retrieve(self, seed: str, budget: int, hops: int = 2) -> list[str]:
+    def retrieve(self, seed: str, budget: int, hops: int = 2, *,
+                 namespace: Optional[str] = None) -> list[str]:
+        check_namespace(self.namespace, namespace)
         return citation_graph_retrieve(self, seed, budget, hops)
 
     def union_retrieve(self, seed: str, budget: int, hops: int = 2,
-                       content_order: Optional[list[str]] = None) -> list[str]:
+                       content_order: Optional[list[str]] = None, *,
+                       namespace: Optional[str] = None) -> list[str]:
+        check_namespace(self.namespace, namespace)
         return graph_union_retrieve(self, seed, budget, hops, content_order)
 
     # -- enrichment --
@@ -226,7 +240,7 @@ class ChangeClosureGraph:
         merged: dict[str, set[str]] = {a: set(bs) for a, bs in self.cites.items()}
         for a, bs in extra.items():
             merged.setdefault(a, set()).update(bs)
-        return ChangeClosureGraph(self.nodes, merged)
+        return ChangeClosureGraph(self.nodes, merged, namespace=self.namespace)
 
 
 # ───────────────────────── precision LLM edge extractor ─────────────────────
@@ -303,10 +317,20 @@ class PrecisionEdgeExtractor:
             os.makedirs(self.cache_dir, exist_ok=True)
 
         def call_one(n: Node) -> tuple[str, list[dict]]:
-            cpath = os.path.join(self.cache_dir, f"{n.id}.json") if self.cache_dir else None
+            cpath = None
+            if self.cache_dir:
+                # key by a hash of id+text: ids are never used as path components, and an edited node
+                # does not reuse a stale entry
+                key = hashlib.sha256(f"{n.id}\x00{n.text}".encode("utf-8", "replace")).hexdigest()
+                cpath = os.path.join(self.cache_dir, f"{key}.json")
             if cpath and os.path.exists(cpath):
-                with open(cpath) as fh:
-                    return n.id, json.load(fh)
+                try:
+                    with open(cpath) as fh:
+                        cached = json.load(fh)
+                    if isinstance(cached, list):
+                        return n.id, cached
+                except (OSError, ValueError):
+                    pass  # unreadable cache entry: fall through and ask again
             user = f"UNIT {n.id}:\n{n.text[:self.max_text_chars]}\n\nALL UNITS:\n{catalog}"
             try:
                 raw = _parse_edges(self.chat_fn(self.system_prompt, user))
@@ -335,7 +359,8 @@ class PrecisionEdgeExtractor:
                     continue
                 if conf < self.min_confidence:
                     continue
-                if trig and _norm(trig)[:40] not in src_norm.get(sid, ""):  # grounding
+                nt = _norm(trig).strip()
+                if not nt or nt[:40] not in src_norm.get(sid, ""):  # grounding: a trigger is required
                     continue
                 edges.setdefault(sid, set()).add(tgt)
         return edges

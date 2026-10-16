@@ -16,8 +16,18 @@ def iter_files(root: str | Path, exts: set[str] = TEXT_EXTS) -> Iterator[Path]:
     if root.is_file():
         yield root
         return
+    try:
+        real_root = root.resolve()
+    except OSError:
+        return
     for p in sorted(root.rglob("*")):
-        if p.is_file() and p.suffix.lower() in exts:
+        if not (p.is_file() and p.suffix.lower() in exts):
+            continue
+        try:
+            inside = p.resolve().is_relative_to(real_root)
+        except (OSError, RuntimeError):
+            inside = False
+        if inside:  # a link pointing outside the ingested root is not followed
             yield p
 
 
@@ -50,18 +60,23 @@ def chunk_text(text: str, size: int = 1000, overlap: int = 150) -> list[str]:
 
 
 def ingest(store, embedder, path: str | Path, size: int = 1000, overlap: int = 150,
-           batch: int = 64) -> dict:
-    """Index a file or folder into ``store``. FTS is rebuilt once by the caller (RAG.index)."""
+           batch: int = 64, prune: bool = True) -> dict:
+    """Index a file or folder into ``store``. FTS is rebuilt once by the caller (RAG.index).
+
+    With ``prune`` (default) documents previously indexed under ``path`` whose source no longer exists (or
+    is no longer eligible, e.g. a link leaving the root) are removed from the store. Pruning only runs when
+    ``path`` currently exists, so an unmounted or missing root never wipes the index.
+    """
     files = list(iter_files(path))
     total = 0
+    unreadable: set[str] = set()
     for f in files:
         try:
             text = f.read_text(encoding="utf-8", errors="ignore")
         except Exception:
+            unreadable.add(str(f))  # transient failure: keep what is indexed
             continue
-        pieces = chunk_text(text, size, overlap)
-        if not pieces:
-            continue
+        pieces = chunk_text(text, size, overlap)  # an emptied source yields none: its old chunks are swept
         try:
             mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
         except Exception:
@@ -90,4 +105,14 @@ def ingest(store, embedder, path: str | Path, size: int = 1000, overlap: int = 1
         prune = getattr(store, "prune_document", None)
         if callable(prune):
             prune(did, seen_ids)
-    return {"files": len(files), "chunks": total}
+    removed = 0
+    root = Path(path)
+    list_ids = getattr(store, "document_ids", None)
+    drop = getattr(store, "prune_document", None)
+    if prune and callable(list_ids) and callable(drop) and root.exists():
+        live = {str(f) for f in files}
+        for did in list_ids(str(root)):
+            if did not in live and did not in unreadable:
+                drop(did, [])
+                removed += 1
+    return {"files": len(files), "chunks": total, "removed_documents": removed}

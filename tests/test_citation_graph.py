@@ -45,9 +45,10 @@ def test_citation_graph_retrieve_recovers_closure_within_budget():
 
 def test_budget_knapsack_is_respected():
     g = _graph()
-    # budget below one node's cost still returns the single highest-priority closure member, never the seed
-    small = citation_graph_retrieve(g, "s362", budget=1, hops=2)
-    assert len(small) == 1 and small[0] in {"s101", "s541"}
+    # a budget below every node's cost returns nothing; the total never exceeds the budget
+    assert citation_graph_retrieve(g, "s362", budget=1, hops=2) == []
+    tight = citation_graph_retrieve(g, "s362", budget=12, hops=2)
+    assert tight and "s362" not in tight and sum(g.tokens[i] for i in tight) <= 12
 
 
 def test_graph_union_fills_tail_with_content_order():

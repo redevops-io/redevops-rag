@@ -114,6 +114,23 @@ precision-gated (confidence + verbatim-trigger grounding) so the edges *help* th
 bloat it, and fail-soft when no endpoint is reachable. *Which* representation (graph, content, or their
 union) to spend the budget on for a given task is a Context-Runtime decision, not a fixed retriever.
 
+Retrieval budgets are hard limits: the returned nodes never exceed `budget` tokens (an oversize node is
+skipped so smaller later ones can still fit), and ordering is deterministic (hop, then in-degree, then id).
+
+### Tenant scoping and namespaces
+
+Tenant isolation is the **caller's job**. A `Store`, `PgStore` or `ChangeClosureGraph` holds one corpus, and
+`document_ids=None` means *unscoped* (every document). To get a cheap safety net, construct the component with
+`namespace="tenant-a"`; any request that passes a different (or no) `namespace` — e.g.
+`hybrid_search(store, q, namespace="tenant-a")`, `graph.retrieve(seed, budget, namespace="tenant-a")` — raises
+`NamespaceMismatch`. Without a namespace on the component, no check is made.
+
+### Re-indexing and deleted sources
+
+`rag.index(path)` removes documents previously indexed under `path` whose source file no longer exists
+(pass `prune=False` to `ingest` to keep them). Pruning is skipped when `path` itself is missing, so an
+unmounted folder never empties the index. Symbolic links that resolve outside the indexed root are not followed.
+
 ## Why a folder, not a sync
 
 Point it at one **central** copy of the knowledge base and query it — you don't copy 200k
