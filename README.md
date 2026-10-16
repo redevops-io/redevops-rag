@@ -17,7 +17,7 @@
 Hybrid RAG as a small, installable library + CLI — **DuckDB vector + BM25 fused via
 Reciprocal Rank Fusion, recency & keyword priors, and an optional cross-encoder rerank.**
 
-It's the retrieval pipeline from `redevops-io/rag-saas-platform` (a **private** repository, not publicly available)
+It's the retrieval pipeline from a ReDevOps application repository that is not public
 carved out of its multi-tenant SaaS shell (no Auth0/Stripe/Kubernetes/workspace coupling) so
 you can drop the *same* retrieval over any folder — a docs tree, a repo, an Obsidian vault —
 in three lines.
@@ -106,7 +106,7 @@ g.union_retrieve("s362", budget=4000, content_order=content)
 In ReDevOps' own benchmark runs, measured against BM25 / dense / HippoRAG-style PageRank at a matched 4000-token budget,
 `citation_graph` won or tied on every case across statutes (0.556 vs 0.159), regulations→statutes (0.484 vs 0.066),
 real contracts (0.302 vs 0.209) and defined-terms (1.000 vs 0.206). **Not reproducible from this repo:** these results
-live in a private repository (`redevops-benchmarks`, not public) and no script or result file in this repo regenerates them.
+are not reproducible from this repository and no script or result file in this repo regenerates them.
 Treat them as unverified by third parties; see the [blog](https://redevops.io/blog) for the write-up. The defined-terms
 1.000 is a ceiling value, and the benchmark set is not described in this repo. The ceiling is **edge coverage**; where genuinely-implicit
 edges have no parseable reference, `PrecisionEdgeExtractor` recovers them from an injectable LLM —

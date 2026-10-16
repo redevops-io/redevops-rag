@@ -15,10 +15,10 @@
 
 ## Not supported / not claimed
 - No third-party reproduction of any benchmark. `benchmarks/` scripts and `benchmarks/results/` are internally produced.
-- The `citation_graph` comparison numbers in the README (e.g. 0.556 vs 0.159) are **not reproducible from this repo**: the data lives in a private repository (`redevops-benchmarks`).
-- `rag-saas-platform`, the project this was carved out of, is private.
+- The `citation_graph` comparison numbers in the README (e.g. 0.556 vs 0.159) are **not reproducible from this repo**: no script or result file in this repo regenerates them.
+- The project this was carved out of is not public.
 - `ask` requires you to supply an OpenAI-compatible LLM endpoint.
 
 ## Known issues
 - Version mismatch: tag `v0.4.0` vs `__version__ == "0.2.0"`. Documented only; no code change made in the docs PR.
-- Licence wording is inconsistent (README footer vs `LICENSE.md`); under counsel review. See `LICENSE.md`.
+- Licence: see `LICENSE.md` for the authoritative terms.

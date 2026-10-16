@@ -13,4 +13,4 @@ This is what CI runs (Python 3.12). Postgres-store tests skip unless `REDEVOPS_R
 - Keep changes small and focused; add or update a test in `tests/` for behaviour changes.
 - Do not commit secrets (a secret-scan workflow runs on the repo).
 - Documentation claims with numbers must point to a script or result file in this repo, or be labelled as not reproducible from it.
-- Contributions are accepted under the licence in [LICENSE.md](LICENSE.md); questions about licensing: contact to be confirmed (use a GitHub issue meanwhile).
+- Contributions are accepted under the licence in [LICENSE.md](LICENSE.md).
