@@ -64,8 +64,10 @@ class RAG:
             from .rerank import Reranker
             self.reranker = Reranker(rerank_model)
 
-    def index(self, path: str, size: int = 1000, overlap: int = 150) -> dict:
-        result = _ingest(self.store, self.embedder, path, size=size, overlap=overlap)
+    def index(self, path: str, size: int = 1000, overlap: int = 150, *, prune: bool = True,
+              allow_empty: bool = False, max_prune_fraction: float = 0.5) -> dict:
+        result = _ingest(self.store, self.embedder, path, size=size, overlap=overlap, prune=prune,
+                         allow_empty=allow_empty, max_prune_fraction=max_prune_fraction)
         self.store.reindex_fts()
         return result
 

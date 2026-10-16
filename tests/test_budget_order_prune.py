@@ -189,3 +189,40 @@ def test_store_namespace_guard(tmp_path):
         hybrid_search(s, "alpha", namespace="t2")
     with pytest.raises(NamespaceMismatch):
         hybrid_search(s, "alpha")
+
+
+def test_prune_false_keeps_deleted_sources_via_rag_index(tmp_path):
+    from redevops_rag import RAG
+    emb, s = _store()
+    rag = RAG.__new__(RAG)
+    rag.store, rag.embedder = s, emb
+    (tmp_path / "a.md").write_text("alpha text")
+    (tmp_path / "b.md").write_text("beta text")
+    rag.index(str(tmp_path))
+    (tmp_path / "a.md").unlink()
+    rag.index(str(tmp_path), prune=False)
+    assert s.count() == 2
+    assert rag.index(str(tmp_path))["removed_documents"] == 1
+    assert s.count() == 1
+
+
+def test_empty_scan_does_not_wipe_index_unless_allowed(tmp_path):
+    emb, s = _store()
+    (tmp_path / "a.md").write_text("alpha text")
+    ingest(s, emb, tmp_path)
+    (tmp_path / "a.md").unlink()                      # root exists but is empty
+    r = ingest(s, emb, tmp_path)
+    assert r["prune_refused"] is True and s.count() == 1
+    r = ingest(s, emb, tmp_path, allow_empty=True)
+    assert r["removed_documents"] == 1 and s.count() == 0
+
+
+def test_prune_refused_when_too_large_a_fraction_would_go(tmp_path):
+    emb, s = _store()
+    for n in "abcd":
+        (tmp_path / f"{n}.md").write_text(f"text {n}")
+    ingest(s, emb, tmp_path)
+    for n in "abc":
+        (tmp_path / f"{n}.md").unlink()
+    assert ingest(s, emb, tmp_path)["prune_refused"] is True and s.count() == 4
+    assert ingest(s, emb, tmp_path, max_prune_fraction=0.9)["removed_documents"] == 3

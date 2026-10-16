@@ -123,13 +123,16 @@ Tenant isolation is the **caller's job**. A `Store`, `PgStore` or `ChangeClosure
 `document_ids=None` means *unscoped* (every document). To get a cheap safety net, construct the component with
 `namespace="tenant-a"`; any request that passes a different (or no) `namespace` — e.g.
 `hybrid_search(store, q, namespace="tenant-a")`, `graph.retrieve(seed, budget, namespace="tenant-a")` — raises
-`NamespaceMismatch`. Without a namespace on the component, no check is made.
+`NamespaceMismatch`. Without a namespace on the component, no check is made. The guard is opt-in and covers `hybrid_search` and
+the graph retrieval methods only; calling `Store`/`PgStore` search methods directly is unguarded.
 
 ### Re-indexing and deleted sources
 
-`rag.index(path)` removes documents previously indexed under `path` whose source file no longer exists
-(pass `prune=False` to `ingest` to keep them). Pruning is skipped when `path` itself is missing, so an
-unmounted folder never empties the index. Symbolic links that resolve outside the indexed root are not followed.
+Deletion happens only on re-index (there are no tombstones): `rag.index(path)` removes documents previously
+indexed under `path` whose source file no longer exists. Safeguards: pruning is skipped when `path` is
+missing; it is refused (`prune_refused` in the result) when the scan finds no files or when more than
+`max_prune_fraction` (default 0.5) of the indexed documents would go, unless `allow_empty=True`; pass
+`prune=False` to keep everything. Symbolic links that resolve outside the indexed root are not followed.
 
 ## Why a folder, not a sync
 
