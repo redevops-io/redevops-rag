@@ -11,6 +11,8 @@ import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
+from .namespace import check_namespace
+
 if TYPE_CHECKING:  # avoid importing duckdb just to type-hint
     from .store import Store
 
@@ -95,6 +97,7 @@ def hybrid_search(
     reranker: Optional["Reranker"] = None,  # noqa: F821
     document_ids: list | None = None,
     query_mode: str = "auto",
+    namespace: str | None = None,
 ) -> list[dict[str, Any]]:
     """Vector + BM25 → RRF → recency/keyword boosts → optional cross-encoder rerank.
 
@@ -104,6 +107,7 @@ def hybrid_search(
     ``query_mode`` controls the vector leg's query encoding for asymmetric encoders
     (``instruct``/``plain``/``auto``) — inert for a symmetric encoder like bge.
     """
+    check_namespace(getattr(store, "namespace", None), namespace)
     if not query or not query.strip():
         return []
     try:

@@ -7,6 +7,7 @@ extension and soft-fails to an empty sparse leg if it can't load.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -28,7 +29,11 @@ def _fts_ident(name: str) -> str:
 
 class Store:
     def __init__(self, embedder, db_path: str = ":memory:", *,
-                 fts_stemmer: str = "porter", fts_stopwords: str = "english"):
+                 fts_stemmer: str = "porter", fts_stopwords: str = "english",
+                 namespace: str | None = None):
+        # Optional guard: when set, retrieval calls naming a different namespace are rejected. Tenant
+        # scoping is otherwise the caller's job (see README).
+        self.namespace = namespace
         # BM25/FTS stemmer + stopwords. DuckDB defaults (porter/english) can't normalize non-English
         # inflection — a Russian query "Фолиновую кислоту" (accusative) misses a doc "фолиновая кислота"
         # (nominative). Pass fts_stemmer='russian', fts_stopwords='none' for an RU corpus (Snowball
@@ -143,6 +148,15 @@ class Store:
             "DELETE FROM chunks WHERE document_id = ? AND id NOT IN "
             "(SELECT unnest(?::VARCHAR[]))", [document_id, keep])
         return int(removed)
+
+    def document_ids(self, root: str) -> list[str]:
+        """Distinct document ids equal to ``root`` or located under it (``root`` + path separator)."""
+        sep = os.sep
+        prefix = root.rstrip(sep) + sep
+        rows = self.con.execute(
+            "SELECT DISTINCT document_id FROM chunks WHERE document_id = ? OR starts_with(document_id, ?)",
+            [root, prefix]).fetchall()
+        return [r[0] for r in rows]
 
     def reindex_fts(self) -> None:
         if not self._fts:

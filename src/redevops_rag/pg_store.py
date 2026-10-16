@@ -64,7 +64,9 @@ class PgStore:
         conn_url: str,
         table: str = "redevops_rag_chunks",
         schema: str | None = None,
+        namespace: str | None = None,
     ) -> None:
+        self.namespace = namespace
         self.embedder = embedder
         self.dim = int(embedder.dim)
         self.table = _valid_ident(table)
@@ -233,6 +235,17 @@ class PgStore:
                     f"WHERE document_id = %s AND NOT (id = ANY(%s))", [document_id, keep])
         self.con.commit()
         return removed
+
+    def document_ids(self, root: str) -> list[str]:
+        """Distinct document ids equal to ``root`` or located under it. Mirrors the DuckDB Store."""
+        import os
+        prefix = root.rstrip(os.sep) + os.sep
+        with self.con.cursor() as cur:
+            cur.execute(
+                f"SELECT DISTINCT document_id FROM {self._qtable} "
+                f"WHERE document_id = %s OR left(document_id, %s) = %s",
+                [root, len(prefix), prefix])
+            return [r[0] for r in cur.fetchall()]
 
     def reindex_fts(self) -> None:
         """Post-bulk-load maintenance. tsvector is auto-maintained by the
