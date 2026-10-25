@@ -25,6 +25,9 @@ llm = ["openai>=1.30"]
 # as `db_path` to `RAG(...)`.
 pg = ["psycopg[binary]>=3.1", "pgvector>=0.3"]
 
+# Parquet/S3-backed retrieval (redevops_rag.parquet_index): Polars scan + BM25, no DuckDB store needed.
+parquet = ["polars>=1.0"]
+
 [project.scripts]
 redevops-rag = "redevops_rag.cli:main"
 
@@ -43,4 +46,5 @@ packages = ["src/redevops_rag"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "polars>=1.0",
 ]

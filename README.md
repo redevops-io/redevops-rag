@@ -169,3 +169,11 @@ contracts, while stores and providers sit behind small interfaces at the boundar
 AGPL-3.0-or-later · redevops.io
 
 > Note: the repository's [`LICENSE.md`](LICENSE.md) is titled "License" and describes the project as "source-available, not open source in the OSI sense", licensed under AGPL-3.0-or-later "as modified by the Commons Clause License Condition v1.0". The one-line footer above omits the Commons Clause; it is under counsel review and the wording is intentionally unchanged here.
+
+
+## Parquet / S3 retrieval (optional)
+
+`redevops_rag.parquet_index` (extra `parquet`) retrieves over Parquet instead of the DuckDB store: BM25 computed with Polars over a
+`scan_parquet` (local path, glob or `s3://` prefix, with projection and predicate pushdown), and a `ChangeClosureGraph` loaded from an
+edge table. `content_led(...)` composes a content ranking with the seed's forward (what governs it) and reverse (what it affects)
+closure under a token budget. It is a primitive: the composition policy stays with the caller.
