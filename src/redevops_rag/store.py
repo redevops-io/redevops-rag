@@ -263,11 +263,38 @@ class Store:
         ).fetchall()
         return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
+    # DuckDB's own match_bm25 defaults (k1, b); the scoped query below reproduces its formula exactly.
+    BM25_K1 = 1.2
+    BM25_B = 0.75
+
+    def _scoped_bm25_supported(self) -> bool:
+        """The scoped query reads DuckDB's FTS index tables (docs.field_lens, stats.num_docs). Verify the layout once, so an
+        unexpected DuckDB version fails closed (leg unavailable) instead of silently falling back to corpus-wide statistics."""
+        ok = getattr(self, "_scoped_bm25_ok", None)
+        if ok is None:
+            try:
+                cols = {(r[0], r[1]) for r in self.con.execute(
+                    "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'fts_main_chunks'").fetchall()}
+                ok = {("docs", "docid"), ("docs", "name"), ("docs", "field_lens"), ("terms", "docid"), ("terms", "termid"),
+                      ("dict", "termid"), ("dict", "term")} <= cols
+            except Exception:
+                ok = False
+            self._scoped_bm25_ok = ok
+        return ok
+
     def bm25_search(self, text: str, limit: int = 50,
                     document_ids: list | None = None, *, strict: bool = False,
-                    tenant_scope: str | None = None) -> list[dict]:
+                    tenant_scope: str | None = None, scoped_stats: bool | None = None) -> list[dict]:
         """BM25 over the FTS index. ``strict=False`` (default, legacy) returns ``[]`` when the leg cannot run.
-        ``strict=True`` raises :class:`BackendUnavailable` instead, so a caller can tell "no match" from "no index"."""
+        ``strict=True`` raises :class:`BackendUnavailable` instead, so a caller can tell "no match" from "no index".
+
+        ``scoped_stats`` chooses where the corpus statistics (document count, per-term document frequency, average
+        length) come from. ``False``: the whole index, as DuckDB's ``match_bm25`` does — a scoped query's scores then
+        depend on documents outside the scope, which is an information leak across tenants and makes scores change when
+        unrelated documents are ingested. ``True``: only the rows that satisfy the scope (``tenant_scope`` and/or
+        ``document_ids``), so a document scores identically whether it sits in a standalone index or in a larger one.
+        Default ``None`` ⇒ ``True`` when a ``tenant_scope`` is in force, else ``False`` (legacy ``document_ids`` behaviour
+        is unchanged). Ties are broken on ``id`` so results are deterministic."""
         scope_v = self._scope(tenant_scope)          # validated before anything else, even for a blank query
         if not text.strip():
             return []
@@ -275,6 +302,24 @@ class Store:
             if strict:
                 raise BackendUnavailable("full-text search extension is not loaded")
             return []
+        if scoped_stats is None:
+            scoped_stats = scope_v is not None
+        try:
+            if scoped_stats:
+                if not self._scoped_bm25_supported():
+                    raise BackendUnavailable("scoped BM25 statistics are not supported by this DuckDB full-text-search layout")
+                rows = self._bm25_scoped(text, limit, document_ids, scope_v)
+            else:
+                rows = self._bm25_global(text, limit, document_ids, scope_v)
+        except Exception as e:
+            if strict:
+                if isinstance(e, BackendUnavailable):
+                    raise
+                raise BackendUnavailable(f"bm25 query failed: {type(e).__name__}: {redact(e)}") from e
+            return []
+        return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
+
+    def _bm25_global(self, text, limit, document_ids, scope_v):
         scope = ""
         params: list = [text]
         if document_ids is not None:
@@ -284,20 +329,46 @@ class Store:
             scope += "AND tenant_scope = ? "
             params.append(scope_v)
         params.append(int(limit))
-        try:
-            rows = self.con.execute(
-                f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, score
-                   FROM (
-                       SELECT *, fts_main_chunks.match_bm25(id, ?) AS score FROM chunks
-                   )
-                   WHERE score IS NOT NULL {scope}ORDER BY score DESC LIMIT ?""",
-                params,
-            ).fetchall()
-        except Exception as e:
-            if strict:
-                raise BackendUnavailable(f"bm25 query failed: {type(e).__name__}: {redact(e)}") from e
-            return []
-        return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
+        return self.con.execute(
+            f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, score
+               FROM (
+                   SELECT *, fts_main_chunks.match_bm25(id, ?) AS score FROM chunks
+               )
+               WHERE score IS NOT NULL {scope}ORDER BY score DESC, id LIMIT ?""",
+            params,
+        ).fetchall()
+
+    def _bm25_scoped(self, text, limit, document_ids, scope_v):
+        where, params = ["TRUE"], []
+        if document_ids is not None:
+            where.append("c.document_id = ANY(?::VARCHAR[])"); params.append(list(document_ids))
+        if scope_v is not None:
+            where.append("c.tenant_scope = ?"); params.append(scope_v)
+        k1, b = float(self.BM25_K1), float(self.BM25_B)
+        stem = self.fts_stemmer                                   # validated identifier (see __init__)
+        sql = f"""
+            WITH scoped AS (
+                SELECT d.docid, d.name, d.field_lens[1] AS dl
+                FROM fts_main_chunks.docs AS d JOIN chunks AS c ON c.id = d.name
+                WHERE {' AND '.join(where)}),
+            st AS (SELECT count(*)::DOUBLE AS n, nullif(avg(dl)::DOUBLE, 0) AS avgdl FROM scoped),
+            raw AS (SELECT DISTINCT unnest(fts_main_chunks.tokenize(?)) AS t),
+            toks AS (SELECT DISTINCT stem(t, '{stem}') AS t FROM raw
+                     WHERE t IS NOT NULL AND t <> '' AND t NOT IN (SELECT sw FROM fts_main_chunks.stopwords)),
+            qt AS (SELECT dict.termid FROM fts_main_chunks.dict AS dict JOIN toks ON dict.term = toks.t),
+            tf AS (SELECT t.docid, t.termid, count(*)::DOUBLE AS tf
+                   FROM fts_main_chunks.terms AS t JOIN scoped AS s ON s.docid = t.docid
+                   WHERE t.termid IN (SELECT termid FROM qt) GROUP BY 1, 2),
+            df AS (SELECT termid, count(*)::DOUBLE AS df FROM tf GROUP BY 1),
+            sc AS (SELECT tf.docid,
+                          sum(log10(((st.n - df.df + 0.5) / (df.df + 0.5)) + 1)
+                              * (((tf.tf / ((1.0 - {b}) + {b} * (s.dl / st.avgdl))) * ({k1} + 1))
+                                 / ((tf.tf / ((1.0 - {b}) + {b} * (s.dl / st.avgdl))) + {k1}))) AS score
+                   FROM tf JOIN df USING (termid) JOIN scoped AS s USING (docid) CROSS JOIN st GROUP BY tf.docid)
+            SELECT c.id, c.document_id, c.filename, c.chunk_index, c.content_hash, c.text, c.metadata, c.created_at, sc.score
+            FROM sc JOIN scoped AS s ON s.docid = sc.docid JOIN chunks AS c ON c.id = s.name
+            WHERE sc.score IS NOT NULL ORDER BY sc.score DESC, c.id LIMIT ?"""
+        return self.con.execute(sql, [*params, text, int(limit)]).fetchall()
 
     @staticmethod
     def _row(r, score_key: str, score_val, source: str) -> dict:

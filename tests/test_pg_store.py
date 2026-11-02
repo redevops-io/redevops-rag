@@ -402,3 +402,24 @@ def test_pg_a_row_owned_by_another_scope_is_never_replaced(tenant_store, embedde
     with tenant_store.con.cursor() as cur:
         cur.execute(f"SELECT text, tenant_scope FROM {tenant_store._qtable} WHERE id = %s", [qualify_id("tenant-A", "r0")])
         assert cur.fetchone() == ("alpha original", "tenant-X")
+
+
+def test_pg_lexical_scores_do_not_depend_on_other_tenants_documents(embedder):
+    """ts_rank_cd is a per-document function (no corpus-wide IDF), so adding another tenant's rows cannot move a score."""
+    from redevops_rag.pg_store import PgStore
+
+    t1, t2 = (f"rag_bm25_{uuid.uuid4().hex[:10]}" for _ in range(2))
+    a, b = (PgStore(embedder, PG_URL, table=t, tenant_aware=True) for t in (t1, t2))
+    try:
+        rows = _tenant_rows(embedder, "r", 5, "quarterly budget forecast alpha alpha")
+        a.add_chunks([dict(r) for r in rows], tenant_scope="tenant-A")
+        b.add_chunks([dict(r) for r in rows], tenant_scope="tenant-A")
+        b.add_chunks(_tenant_rows(embedder, "z", 200, "budget forecast alpha budget forecast"), tenant_scope="tenant-Z")
+        sa = {h["chunk_id"]: h["bm25_score"] for h in a.bm25_search("budget forecast alpha", limit=100, tenant_scope="tenant-A")}
+        sb = {h["chunk_id"]: h["bm25_score"] for h in b.bm25_search("budget forecast alpha", limit=100, tenant_scope="tenant-A")}
+        assert sa and sa == sb
+    finally:
+        for s, t in ((a, t1), (b, t2)):
+            with s.con.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS "{t}"'); cur.execute(f'DROP TABLE IF EXISTS "{t}_meta"')
+            s.con.commit(); s.close()
