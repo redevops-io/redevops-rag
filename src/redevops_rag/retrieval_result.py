@@ -63,6 +63,9 @@ class RetrievalResult:
     legs: tuple[LegReport, ...] = ()
     as_of: Optional[datetime] = None        # the "now" used for recency scoring (wall clock when not supplied)
     notes: list[str] = field(default_factory=list)
+    # How the request was isolated: "tenant_aware" (the store enforces a tenant scope and one was applied) or
+    # "unscoped" (no enforcement — NEVER evidence of tenant isolation, whatever the data happened to contain).
+    isolation: str = "unscoped"
 
     @property
     def usable(self) -> bool:
@@ -78,7 +81,7 @@ class RetrievalResult:
         return [leg for leg in self.legs if not leg.ok]
 
     def to_dict(self) -> dict[str, Any]:
-        return {"status": self.status.value, "n_hits": len(self.hits), "as_of": self.as_of.isoformat() if self.as_of else None,
+        return {"status": self.status.value, "n_hits": len(self.hits), "as_of": self.as_of.isoformat() if self.as_of else None, "isolation": self.isolation,
                 "legs": [{"name": l.name, "ok": l.ok, "n_hits": l.n_hits, "error": l.error, "checked": l.checked} for l in self.legs],
                 "notes": list(self.notes)}
 

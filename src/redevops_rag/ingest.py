@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .nemo_retriever import chunk_identity, content_hash
+from .tenancy import TenantScopeError, validate_tenant_scope
 
 TEXT_EXTS = {".md", ".markdown", ".mdx", ".txt", ".rst", ".org", ".text"}
 
@@ -61,7 +62,7 @@ def chunk_text(text: str, size: int = 1000, overlap: int = 150) -> list[str]:
 
 def ingest(store, embedder, path: str | Path, size: int = 1000, overlap: int = 150,
            batch: int = 64, prune: bool = True, allow_empty: bool = False,
-           max_prune_fraction: float = 0.5) -> dict:
+           max_prune_fraction: float = 0.5, tenant_scope: str | None = None) -> dict:
     """Index a file or folder into ``store``. FTS is rebuilt once by the caller (RAG.index).
 
     With ``prune`` (default) documents previously indexed under ``path`` whose source no longer exists (or
@@ -69,7 +70,15 @@ def ingest(store, embedder, path: str | Path, size: int = 1000, overlap: int = 1
     ``path`` currently exists, so an unmounted or missing root never wipes the index. A sweep is also refused
     (``prune_refused`` in the result) when the scan found no files, or when it would remove more than
     ``max_prune_fraction`` of the documents indexed under ``path``; ``allow_empty=True`` overrides both.
+
+    ``tenant_scope`` stamps every chunk with its tenant and confines the re-ingest sweep and the stale-document
+    prune to that tenant. A tenant-aware store refuses an ingest without one (before any file is read).
     """
+    if tenant_scope is not None:
+        validate_tenant_scope(tenant_scope)
+    elif getattr(store, "tenant_aware", False):
+        raise TenantScopeError("tenant-aware store: ingest needs a tenant_scope")
+    scope_kw = {"tenant_scope": tenant_scope} if tenant_scope is not None else {}
     files = list(iter_files(path))
     total = 0
     unreadable: set[str] = set()
@@ -102,12 +111,12 @@ def ingest(store, embedder, path: str | Path, size: int = 1000, overlap: int = 1
                     "chunk_index": i + j, "content_hash": ch, "text": t, "embedding": e,
                     "metadata": {"path": str(f)}, "created_at": mtime,
                 })
-            total += store.add_chunks(rows)
+            total += store.add_chunks(rows, **scope_kw)
         # Re-ingest sweep: drop any prior chunk of this document whose content no longer exists (a
         # shrunk source's tail chunks, or edited content that moved to a new content-addressed id).
         sweep = getattr(store, "prune_document", None)
         if callable(sweep):
-            sweep(did, seen_ids)
+            sweep(did, seen_ids, **scope_kw)
     removed = 0
     refused = False
     root = Path(path)
@@ -115,13 +124,13 @@ def ingest(store, embedder, path: str | Path, size: int = 1000, overlap: int = 1
     drop = getattr(store, "prune_document", None)
     if prune and callable(list_ids) and callable(drop) and root.exists():
         live = {str(f) for f in files}
-        stale = [d for d in list_ids(str(root)) if d not in live and d not in unreadable]
-        indexed = len(set(list_ids(str(root))))
+        stale = [d for d in list_ids(str(root), **scope_kw) if d not in live and d not in unreadable]
+        indexed = len(set(list_ids(str(root), **scope_kw)))
         too_many = indexed > 0 and len(stale) / indexed > max_prune_fraction
         if stale and not allow_empty and (not files or too_many):
             refused = True   # looks like a failed mount or a bulk loss, not a deliberate deletion
         else:
             for did in stale:
-                drop(did, [])
+                drop(did, [], **scope_kw)
                 removed += 1
     return {"files": len(files), "chunks": total, "removed_documents": removed, "prune_refused": refused}

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 from .namespace import NamespaceMismatch, check_namespace
+from .tenancy import TenantScopeError, validate_tenant_scope
 from .retrieval_result import (LegReport, RetrievalResult, RetrievalStatus, RetrievalUnavailable,
                                redact)
 
@@ -108,11 +109,31 @@ def _run_leg(name: str, fn) -> tuple[list[dict[str, Any]], LegReport]:
     return hits, LegReport(name=name, ok=True, n_hits=len(hits))
 
 
-def _supports_strict(fn) -> bool:
+def _supports(fn, param: str) -> bool:
     try:
-        return "strict" in inspect.signature(fn).parameters
+        return param in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
+
+
+def _supports_strict(fn) -> bool:
+    return _supports(fn, "strict")
+
+
+def _scope_refusal(store, tenant_scope) -> Optional[str]:
+    """Why a request must be refused on tenant grounds (``None`` = it may proceed). Fail closed: on a tenant-aware store
+    a missing scope is a refusal, and so is any scope the store cannot enforce."""
+    try:
+        if tenant_scope is None:
+            if getattr(store, "tenant_aware", False):
+                raise TenantScopeError("tenant-aware store: a tenant_scope is required")
+            return None
+        validate_tenant_scope(tenant_scope)
+        if not (_supports(store.semantic_search, "tenant_scope") and _supports(store.bm25_search, "tenant_scope")):
+            raise TenantScopeError("this store cannot enforce a tenant scope")
+    except TenantScopeError as e:
+        return redact(str(e))
+    return None
 
 
 def hybrid_search_result(
@@ -129,33 +150,44 @@ def hybrid_search_result(
     query_mode: str = "auto",
     namespace: str | None = None,
     as_of: Optional[datetime] = None,
+    tenant_scope: str | None = None,
 ) -> RetrievalResult:
     """:func:`hybrid_search` with an explicit outcome (see :mod:`redevops_rag.retrieval_result`).
 
     Never raises for a backend failure: a leg that cannot run is reported in ``result.legs`` and the status becomes
     ``DEGRADED`` (one leg) or ``UNAVAILABLE`` (both). A namespace refusal is returned as ``DENIED``. ``as_of`` fixes the
-    evaluation time of the recency boost (default: the wall clock, recorded in ``result.as_of``)."""
+    evaluation time of the recency boost (default: the wall clock, recorded in ``result.as_of``).
+
+    ``tenant_scope``: on a tenant-aware store (``store.tenant_aware``) it is **required**; a missing, invalid or
+    un-enforceable scope is refused as ``DENIED`` before any retrieval runs (fail closed). On an unscoped store it is
+    optional; if given it is applied as a filter in every leg. ``result.isolation`` reports which of the two held."""
     now = _aware(as_of) if as_of is not None else datetime.now(timezone.utc)
+    tenant_aware = bool(getattr(store, "tenant_aware", False))
+    isolation = "tenant_aware" if tenant_aware else "unscoped"
     try:
         check_namespace(getattr(store, "namespace", None), namespace)
     except NamespaceMismatch as e:
-        return RetrievalResult([], RetrievalStatus.DENIED, (), now, [redact(str(e))])
+        return RetrievalResult([], RetrievalStatus.DENIED, (), now, [redact(str(e))], isolation)
+    refusal = _scope_refusal(store, tenant_scope)
+    if refusal is not None:
+        return RetrievalResult([], RetrievalStatus.DENIED, (), now, [refusal], isolation)
+    scope_kw = {"tenant_scope": tenant_scope} if tenant_scope is not None else {}
     if not query or not query.strip():
-        return RetrievalResult([], RetrievalStatus.EMPTY, (), now, ["blank query"])
+        return RetrievalResult([], RetrievalStatus.EMPTY, (), now, ["blank query"], isolation)
 
     vector_hits, vleg = _run_leg("vector", lambda: store.semantic_search(
-        query, top_k=pool, threshold=vector_threshold, document_ids=document_ids, query_mode=query_mode))
+        query, top_k=pool, threshold=vector_threshold, document_ids=document_ids, query_mode=query_mode, **scope_kw))
     notes: list[str] = []
     if _supports_strict(store.bm25_search):
-        bm25_hits, lleg = _run_leg("bm25", lambda: store.bm25_search(query, limit=pool, document_ids=document_ids, strict=True))
+        bm25_hits, lleg = _run_leg("bm25", lambda: store.bm25_search(query, limit=pool, document_ids=document_ids, strict=True, **scope_kw))
     else:
-        bm25_hits, lleg = _run_leg("bm25", lambda: store.bm25_search(query, limit=pool, document_ids=document_ids))
+        bm25_hits, lleg = _run_leg("bm25", lambda: store.bm25_search(query, limit=pool, document_ids=document_ids, **scope_kw))
         lleg = LegReport(lleg.name, lleg.ok, lleg.n_hits, lleg.error, checked=False)
         notes.append("bm25 leg: this store cannot report failures, an empty list may hide an outage")
     legs = (vleg, lleg)
 
     if not vleg.ok and not lleg.ok:
-        return RetrievalResult([], RetrievalStatus.UNAVAILABLE, legs, now, notes)
+        return RetrievalResult([], RetrievalStatus.UNAVAILABLE, legs, now, notes, isolation)
     fused = rrf_fuse([vector_hits, bm25_hits])
     fused = _apply_score_boosts(query, fused, recency_half_life_days, keyword_boost_per_term, keyword_boost_cap, now=now)
     fused = fused[:pool]
@@ -166,7 +198,7 @@ def hybrid_search_result(
         status = RetrievalStatus.DEGRADED
     else:
         status = RetrievalStatus.COMPLETE if hits else RetrievalStatus.EMPTY
-    return RetrievalResult(hits, status, legs, now, notes)
+    return RetrievalResult(hits, status, legs, now, notes, isolation)
 
 
 def hybrid_search(
@@ -183,6 +215,7 @@ def hybrid_search(
     query_mode: str = "auto",
     namespace: str | None = None,
     as_of: Optional[datetime] = None,
+    tenant_scope: str | None = None,
 ) -> list[dict[str, Any]]:
     """Vector + BM25 → RRF → recency/keyword boosts → optional cross-encoder rerank.
 
@@ -194,15 +227,18 @@ def hybrid_search(
     ``as_of`` fixes the time used by the recency boost (default: now).
 
     List-returning compatibility wrapper over :func:`hybrid_search_result`:
-    a namespace refusal still raises :class:`NamespaceMismatch`; a *degraded* search (one leg down) logs a warning and
+    a namespace refusal still raises :class:`NamespaceMismatch` and a tenant-scope refusal :class:`TenantScopeError`; a *degraded* search (one leg down) logs a warning and
     returns what the other leg found; if **no** leg could run it raises :class:`RetrievalUnavailable` instead of
     returning ``[]`` (which would be indistinguishable from "nothing matches"). Use :func:`hybrid_search_result` to
     inspect the outcome."""
     res = hybrid_search_result(store, query, limit=limit, pool=pool, vector_threshold=vector_threshold,
                                recency_half_life_days=recency_half_life_days, keyword_boost_per_term=keyword_boost_per_term,
                                keyword_boost_cap=keyword_boost_cap, reranker=reranker, document_ids=document_ids,
-                               query_mode=query_mode, namespace=namespace, as_of=as_of)
+                               query_mode=query_mode, namespace=namespace, as_of=as_of, tenant_scope=tenant_scope)
     if res.status is RetrievalStatus.DENIED:
+        # a tenant-scope refusal is a TenantScopeError (also a PermissionError), a namespace refusal a NamespaceMismatch
+        if any("tenant" in n for n in res.notes):
+            raise TenantScopeError(res.notes[0])
         raise NamespaceMismatch("request namespace does not match the namespace of this component")
     if res.status is RetrievalStatus.UNAVAILABLE:
         raise RetrievalUnavailable(res)
@@ -263,6 +299,8 @@ def diver_search(
     recency_half_life_days: float = 0.0,
     reranker: Optional["Reranker"] = None,  # noqa: F821
     document_ids: list | None = None,
+    namespace: str | None = None,
+    tenant_scope: str | None = None,
 ) -> list[dict[str, Any]]:
     """DIVER-style reasoning-intensive retrieval.
 
@@ -278,16 +316,22 @@ def diver_search(
     bge. On a symmetric encoder (bge) both modes are plain ``encode``, so DIVER-over-bge — the
     recommended/cheapest config — stays byte-identical.
     """
+    check_namespace(getattr(store, "namespace", None), namespace)     # refuse BEFORE the query reaches any LLM
+    refusal = _scope_refusal(store, tenant_scope)
+    if refusal is not None:
+        raise TenantScopeError(refusal)
     if not query or not query.strip():
         return []
     if reason_llm is None:
         return hybrid_search(store, query, limit=limit, pool=pool, document_ids=document_ids,
-                             recency_half_life_days=recency_half_life_days, reranker=reranker)
+                             recency_half_life_days=recency_half_life_days, reranker=reranker,
+                             namespace=namespace, tenant_scope=tenant_scope)
     cand: dict[Any, dict] = {}
     expanded = [(query, "instruct")] + [(s, "plain") for s in _expand_query(reason_llm, query, n_subqueries)]
     for q, mode in expanded:
         for h in hybrid_search(store, q, limit=pool, pool=pool, document_ids=document_ids,
-                               recency_half_life_days=recency_half_life_days, query_mode=mode):
+                               recency_half_life_days=recency_half_life_days, query_mode=mode,
+                               namespace=namespace, tenant_scope=tenant_scope):
             cand.setdefault(_ID(h), h)
     candidates = list(cand.values())
     if reranker is not None and candidates:

@@ -30,6 +30,8 @@ class RAG:
         *,
         table: str | None = None,
         schema: str | None = None,
+        namespace: str | None = None,
+        tenant_aware: bool = False,
     ):
         """Create a RAG facade over either a DuckDB file or a Postgres
         (pgvector) database.
@@ -39,6 +41,10 @@ class RAG:
         backend; anything else is treated as a DuckDB path. ``table`` and
         ``schema`` are pgvector-only and let one Postgres host multiple
         corpora side by side (e.g. ``nrag_chunks`` + ``other_chunks``).
+
+        ``namespace`` is a per-store label guard. ``tenant_aware=True`` enables tenant-aware mode (see
+        :mod:`redevops_rag.tenancy`): :meth:`index` and :meth:`search` then require a ``tenant_scope`` and fail closed
+        without one. The default (False) keeps the historical unscoped behaviour, which provides no isolation.
         """
         # Fail fast on config errors BEFORE loading the embedder — the
         # embedder pulls sentence-transformers weights on first call.
@@ -51,23 +57,23 @@ class RAG:
         if is_pg:
             # Lazy import so the base package installs cleanly without psycopg.
             from .pg_store import PgStore
-            kw: dict = {}
+            kw: dict = {"namespace": namespace, "tenant_aware": tenant_aware}
             if table is not None:
                 kw["table"] = table
             if schema is not None:
                 kw["schema"] = schema
             self.store = PgStore(self.embedder, db_path, **kw)
         else:
-            self.store = Store(self.embedder, db_path)
+            self.store = Store(self.embedder, db_path, namespace=namespace, tenant_aware=tenant_aware)
         self.reranker = None
         if use_reranker:
             from .rerank import Reranker
             self.reranker = Reranker(rerank_model)
 
     def index(self, path: str, size: int = 1000, overlap: int = 150, *, prune: bool = True,
-              allow_empty: bool = False, max_prune_fraction: float = 0.5) -> dict:
+              allow_empty: bool = False, max_prune_fraction: float = 0.5, tenant_scope: str | None = None) -> dict:
         result = _ingest(self.store, self.embedder, path, size=size, overlap=overlap, prune=prune,
-                         allow_empty=allow_empty, max_prune_fraction=max_prune_fraction)
+                         allow_empty=allow_empty, max_prune_fraction=max_prune_fraction, tenant_scope=tenant_scope)
         self.store.reindex_fts()
         return result
 
@@ -75,8 +81,9 @@ class RAG:
         return hybrid_search(self.store, query, limit=k, reranker=self.reranker, **kw)
 
     def ask(self, query: str, k: int = 8, model: str | None = None, base_url: str | None = None,
-            api_key: str | None = None, system: str | None = None) -> dict[str, Any]:
-        hits = self.search(query, k=k)
+            api_key: str | None = None, system: str | None = None,
+            **search_kw) -> dict[str, Any]:
+        hits = self.search(query, k=k, **search_kw)
         context = "\n\n".join(f"[{i + 1}] {h['filename']}: {h['text']}" for i, h in enumerate(hits))
         base_url = base_url or os.environ.get("REDEVOPS_RAG_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
         api_key = api_key or os.environ.get("REDEVOPS_RAG_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")

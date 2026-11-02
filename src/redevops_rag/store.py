@@ -28,14 +28,18 @@ def _fts_ident(name: str) -> str:
 
 
 from .retrieval_result import BackendUnavailable, redact
+from .tenancy import TenantScopeError, qualify_id, validate_tenant_scope
 
 class Store:
     def __init__(self, embedder, db_path: str = ":memory:", *,
                  fts_stemmer: str = "porter", fts_stopwords: str = "english",
-                 namespace: str | None = None):
+                 namespace: str | None = None, tenant_aware: bool = False):
         # Optional guard: when set, retrieval calls naming a different namespace are rejected. Tenant
         # scoping is otherwise the caller's job (see README).
         self.namespace = namespace
+        # Tenant-aware mode (see tenancy.py): every read/write/admin call must carry a valid tenant_scope or it is
+        # refused. False (default) = the historical unscoped behaviour, which provides no isolation.
+        self.tenant_aware = bool(tenant_aware)
         # BM25/FTS stemmer + stopwords. DuckDB defaults (porter/english) can't normalize non-English
         # inflection — a Russian query "Фолиновую кислоту" (accusative) misses a doc "фолиновая кислота"
         # (nominative). Pass fts_stemmer='russian', fts_stopwords='none' for an RU corpus (Snowball
@@ -77,7 +81,8 @@ class Store:
                     text VARCHAR,
                     embedding FLOAT[{self.dim}],
                     metadata VARCHAR,
-                    created_at TIMESTAMP
+                    created_at TIMESTAMP,
+                    tenant_scope VARCHAR
                 )"""
         )
         # Migrate a legacy corpus (built before content-addressed identity) in place — add the
@@ -86,6 +91,12 @@ class Store:
             self.con.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_hash VARCHAR")
         except Exception:
             pass
+        try:
+            self.con.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS tenant_scope VARCHAR")
+        except Exception:
+            pass
+        if self.tenant_aware and not self._has_tenant_column():
+            raise TenantScopeError("tenant-aware mode needs a tenant_scope column and this database could not be migrated")
         # key/value index metadata — records which ENCODER built the index so query-time can
         # reconstruct the same one (encoder routing is a static per-index binding; a mismatched
         # query encoder silently returns garbage against these vectors). See open_store / set_meta.
@@ -109,56 +120,92 @@ class Store:
         meta = {k: json.loads(v) for k, v in rows}
         return meta.get(key, default) if key is not None else meta
 
-    def add_chunks(self, chunks: list[dict[str, Any]], reindex: bool = False) -> int:
+    def _has_tenant_column(self) -> bool:
+        return bool(self.con.execute(
+            "SELECT count(*) FROM information_schema.columns WHERE table_name = 'chunks' AND column_name = 'tenant_scope'"
+        ).fetchone()[0])
+
+    def _scope(self, tenant_scope: str | None) -> str | None:
+        """Resolve the scope for a call. Tenant-aware: required and validated. Unscoped: optional (validated if given)."""
+        if tenant_scope is None:
+            if self.tenant_aware:
+                raise TenantScopeError("tenant-aware store: a tenant_scope is required")
+            return None
+        return validate_tenant_scope(tenant_scope)
+
+    def add_chunks(self, chunks: list[dict[str, Any]], reindex: bool = False, *, tenant_scope: str | None = None) -> int:
+        call_scope = self._scope(tenant_scope) if (tenant_scope is not None or not self.tenant_aware) else None
         rows = []
         for c in chunks:
+            row_scope = c.get("tenant_scope")
+            if row_scope is not None:
+                row_scope = validate_tenant_scope(row_scope)
+                if call_scope is not None and row_scope != call_scope:
+                    raise TenantScopeError("chunk tenant_scope differs from the call's tenant_scope")
+            else:
+                row_scope = call_scope
+            if self.tenant_aware and row_scope is None:
+                raise TenantScopeError("tenant-aware store: every chunk needs a tenant_scope")
             # Prefer a content-addressed id (ingest mints `{document_ref}::{content_hash[:16]}`); fall
             # back to a random id only for callers that pass neither. Position-based ids are retired.
             cid = c.get("id") or str(uuid.uuid4())
+            if self.tenant_aware:
+                cid = qualify_id(row_scope, cid)
             rows.append((
                 cid, c.get("document_id"), c.get("filename"), int(c.get("chunk_index", 0)),
                 c.get("content_hash"), c["text"], c["embedding"],
                 json.dumps(c.get("metadata") or {}),
                 c.get("created_at") or datetime.now(timezone.utc),
+                row_scope,
             ))
+        if self.tenant_aware and rows:       # defence in depth: never replace a row that belongs to another scope
+            owner = dict(self.con.execute("SELECT id, tenant_scope FROM chunks WHERE id = ANY(?::VARCHAR[])",
+                                          [[r[0] for r in rows]]).fetchall())
+            if any(r[0] in owner and owner[r[0]] != r[9] for r in rows):
+                raise TenantScopeError("refusing to overwrite a chunk that belongs to a different tenant scope")
         self.con.executemany(
             "INSERT OR REPLACE INTO chunks "
-            "(id, document_id, filename, chunk_index, content_hash, text, embedding, metadata, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)", rows
+            "(id, document_id, filename, chunk_index, content_hash, text, embedding, metadata, created_at, tenant_scope) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", rows
         )
         if reindex:
             self.reindex_fts()
         return len(rows)
 
-    def prune_document(self, document_id: str, keep_ids: list[str]) -> int:
+    def prune_document(self, document_id: str, keep_ids: list[str], *, tenant_scope: str | None = None) -> int:
         """Delete chunks of ``document_id`` whose id is NOT in ``keep_ids`` — the re-ingest sweep that
         removes now-orphaned tail chunks (a source that shrank) and content that changed to a new id.
         Content-addressed ids make re-ingest add the new chunks; this removes the stale ones, so the
-        index never silently keeps a vector that no longer matches current source content."""
-        keep = list(keep_ids)
+        index never silently keeps a vector that no longer matches current source content.
+
+        Tenant-aware: only rows of ``tenant_scope`` are considered, so one tenant's sweep can never delete another's."""
+        scope = self._scope(tenant_scope)
+        keep = [qualify_id(scope, k) for k in keep_ids] if (self.tenant_aware and scope) else list(keep_ids)
+        where, base = "document_id = ?", [document_id]
+        if scope is not None:
+            where += " AND tenant_scope = ?"; base.append(scope)
         # Count first, then delete — DuckDB's DELETE rowcount isn't reliable, so count gives the caller
-        # an accurate orphan count. Empty keep set ⇒ delete every chunk for the document.
+        # an accurate orphan count. Empty keep set ⇒ delete every chunk for the document (within scope).
         if not keep:
-            removed = self.con.execute(
-                "SELECT count(*) FROM chunks WHERE document_id = ?", [document_id]).fetchone()[0]
-            self.con.execute("DELETE FROM chunks WHERE document_id = ?", [document_id])
+            removed = self.con.execute(f"SELECT count(*) FROM chunks WHERE {where}", base).fetchone()[0]
+            self.con.execute(f"DELETE FROM chunks WHERE {where}", base)
             return int(removed)
-        removed = self.con.execute(
-            "SELECT count(*) FROM chunks WHERE document_id = ? AND id NOT IN "
-            "(SELECT unnest(?::VARCHAR[]))", [document_id, keep]).fetchone()[0]
-        self.con.execute(
-            "DELETE FROM chunks WHERE document_id = ? AND id NOT IN "
-            "(SELECT unnest(?::VARCHAR[]))", [document_id, keep])
+        cond = f"{where} AND id NOT IN (SELECT unnest(?::VARCHAR[]))"
+        removed = self.con.execute(f"SELECT count(*) FROM chunks WHERE {cond}", [*base, keep]).fetchone()[0]
+        self.con.execute(f"DELETE FROM chunks WHERE {cond}", [*base, keep])
         return int(removed)
 
-    def document_ids(self, root: str) -> list[str]:
-        """Distinct document ids equal to ``root`` or located under it (``root`` + path separator)."""
+    def document_ids(self, root: str, *, tenant_scope: str | None = None) -> list[str]:
+        """Distinct document ids equal to ``root`` or located under it (``root`` + path separator).
+        Tenant-aware: only the caller's own documents are listed."""
+        scope = self._scope(tenant_scope)
         sep = os.sep
         prefix = root.rstrip(sep) + sep
-        rows = self.con.execute(
-            "SELECT DISTINCT document_id FROM chunks WHERE document_id = ? OR starts_with(document_id, ?)",
-            [root, prefix]).fetchall()
-        return [r[0] for r in rows]
+        sql = "SELECT DISTINCT document_id FROM chunks WHERE (document_id = ? OR starts_with(document_id, ?))"
+        params: list = [root, prefix]
+        if scope is not None:
+            sql += " AND tenant_scope = ?"; params.append(scope)
+        return [r[0] for r in self.con.execute(sql, params).fetchall()]
 
     def reindex_fts(self) -> None:
         if not self._fts:
@@ -187,7 +234,10 @@ class Store:
         return self.embedder.encode([text])[0]
 
     def semantic_search(self, text: str, top_k: int = 50, threshold: float | None = None,
-                        document_ids: list | None = None, query_mode: str = "auto") -> list[dict]:
+                        document_ids: list | None = None, query_mode: str = "auto",
+                        tenant_scope: str | None = None) -> list[dict]:
+        # tenant_scope: required when tenant-aware; filters in the WHERE clause, i.e. BEFORE ORDER BY ... LIMIT.
+        scope_v = self._scope(tenant_scope)
         # threshold=None → the ENCODER's own sim_floor (bge 0.4; Nemotron/ReasonIR 0.1). A single global
         # 0.4 silently discards compressed-sim encoders' vector leg — bge stays byte-identical.
         if threshold is None:
@@ -198,6 +248,9 @@ class Store:
         if document_ids is not None:
             scope = "AND document_id = ANY(?::VARCHAR[]) "
             params.append(list(document_ids))
+        if scope_v is not None:
+            scope += "AND tenant_scope = ? "
+            params.append(scope_v)
         params.append(int(top_k))
         rows = self.con.execute(
             f"""SELECT id, document_id, filename, chunk_index, content_hash, text, metadata, created_at, sim
@@ -211,9 +264,11 @@ class Store:
         return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
-                    document_ids: list | None = None, *, strict: bool = False) -> list[dict]:
+                    document_ids: list | None = None, *, strict: bool = False,
+                    tenant_scope: str | None = None) -> list[dict]:
         """BM25 over the FTS index. ``strict=False`` (default, legacy) returns ``[]`` when the leg cannot run.
         ``strict=True`` raises :class:`BackendUnavailable` instead, so a caller can tell "no match" from "no index"."""
+        scope_v = self._scope(tenant_scope)          # validated before anything else, even for a blank query
         if not text.strip():
             return []
         if not self._fts:
@@ -225,6 +280,9 @@ class Store:
         if document_ids is not None:
             scope = "AND document_id = ANY(?::VARCHAR[]) "
             params.append(list(document_ids))
+        if scope_v is not None:
+            scope += "AND tenant_scope = ? "
+            params.append(scope_v)
         params.append(int(limit))
         try:
             rows = self.con.execute(
@@ -251,14 +309,18 @@ class Store:
             "source_type": source,
         }
 
-    def count(self) -> int:
+    def count(self, *, tenant_scope: str | None = None) -> int:
+        scope = self._scope(tenant_scope)
+        if scope is not None:
+            return int(self.con.execute("SELECT count(*) FROM chunks WHERE tenant_scope = ?", [scope]).fetchone()[0])
         return int(self.con.execute("SELECT count(*) FROM chunks").fetchone()[0])
 
     def close(self) -> None:
         self.con.close()
 
 
-def open_store(db_path: str, embedder=None, **embed_kw) -> "Store":
+def open_store(db_path: str, embedder=None, *, namespace: str | None = None, tenant_aware: bool = False,
+               **embed_kw) -> "Store":
     """Open an existing corpus with the encoder it was BUILT with (read from ``store_meta``).
 
     Encoder routing is a static per-index binding: a corpus embedded with Nemotron must be queried
@@ -267,7 +329,7 @@ def open_store(db_path: str, embedder=None, **embed_kw) -> "Store":
     which encoder a corpus used. Pass ``embedder`` to override; a legacy index with no stamp falls
     back to the default (bge). Never overwrites the existing stamp."""
     if embedder is not None:
-        return Store(embedder, db_path)
+        return Store(embedder, db_path, namespace=namespace, tenant_aware=tenant_aware)
     backend = model = None
     try:  # peek at the stamp without constructing the (possibly heavy) default encoder first
         con = duckdb.connect(db_path)
@@ -283,4 +345,4 @@ def open_store(db_path: str, embedder=None, **embed_kw) -> "Store":
     kw = dict(embed_kw)
     if model and backend in ("nemotron", "reasonir", "colpali", "colqwen"):
         kw.setdefault("model", model)   # bge takes model_name via env, not a positional kw here
-    return Store(make_embedder(backend, **kw), db_path)
+    return Store(make_embedder(backend, **kw), db_path, namespace=namespace, tenant_aware=tenant_aware)

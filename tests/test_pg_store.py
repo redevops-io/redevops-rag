@@ -310,3 +310,79 @@ def test_pg_vector_failure_does_not_poison_the_lexical_leg(store, embedder):
     store.embedder = type("Bad", (), {"dim": 32, "encode": lambda self, t: [[0.0] * 31 for _ in t]})()   # wrong dimension
     r = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
     assert r.status is RetrievalStatus.DEGRADED and r.hits and [l.name for l in r.failed_legs()] == ["vector"]
+
+
+# ── tenant-aware mode on Postgres (same contract as the DuckDB store) ─────────────────────────────────────────────
+@pytest.fixture
+def tenant_store(embedder):
+    from redevops_rag.pg_store import PgStore
+
+    table = f"rag_tenant_{uuid.uuid4().hex[:12]}"
+    s = PgStore(embedder, PG_URL, table=table, tenant_aware=True)
+    yield s
+    with s.con.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
+    s.con.commit()
+    s.close()
+
+
+def _tenant_rows(embedder, prefix, n, text):
+    return [dict(id=f"{prefix}{i}", document_id=f"{prefix}doc{i}", text=text, embedding=embedder.encode([text])[0], chunk_index=0)
+            for i in range(n)]
+
+
+def test_pg_tenant_aware_fails_closed_without_a_valid_scope(tenant_store, embedder):
+    from redevops_rag.retrieval_result import RetrievalStatus
+    from redevops_rag.retrieve import hybrid_search_result
+    from redevops_rag.tenancy import TenantScopeError
+
+    with pytest.raises(TenantScopeError):
+        tenant_store.add_chunks(_tenant_rows(embedder, "x", 1, "budget forecast"))
+    for bad in (None, "", "*", "a::b", 5):
+        r = hybrid_search_result(tenant_store, "budget forecast", tenant_scope=bad)
+        assert r.status is RetrievalStatus.DENIED and r.legs == () and r.isolation == "tenant_aware"
+        with pytest.raises(TenantScopeError):
+            tenant_store.bm25_search("budget", tenant_scope=bad)
+
+
+def test_pg_tenant_filter_applies_before_limit_in_both_legs_and_ids_do_not_collide(tenant_store, embedder):
+    from redevops_rag.retrieve import hybrid_search
+
+    # tenant-A: 20 strong matches that outrank tenant-B's single weaker one; same ids/doc ids across tenants
+    tenant_store.add_chunks(_tenant_rows(embedder, "r", 20, "quarterly budget forecast alpha alpha"), tenant_scope="tenant-A")
+    tenant_store.add_chunks(_tenant_rows(embedder, "r", 1, "quarterly budget forecast alpha alpha"), tenant_scope="tenant-B")
+    assert tenant_store.count(tenant_scope="tenant-A") == 20 and tenant_store.count(tenant_scope="tenant-B") == 1
+    for tenant in ("tenant-A", "tenant-B"):
+        for hits in (tenant_store.semantic_search("budget forecast", top_k=1, threshold=-1.0, tenant_scope=tenant),
+                     tenant_store.bm25_search("budget forecast", limit=1, tenant_scope=tenant),
+                     hybrid_search(tenant_store, "budget forecast", limit=1, pool=1, tenant_scope=tenant, vector_threshold=-1.0)):
+            assert len(hits) == 1 and hits[0]["chunk_id"].startswith(tenant + "::")
+    wide = hybrid_search(tenant_store, "budget", limit=100, pool=100, tenant_scope="tenant-B", vector_threshold=-1.0)
+    assert {h["chunk_id"] for h in wide} == {"tenant-B::r0"}
+
+
+def test_pg_prune_and_document_listing_are_confined_to_the_tenant(tenant_store, embedder):
+    rows = lambda ids: [dict(id=i, document_id="/data/doc.md", text="alpha " + i, embedding=embedder.encode(["alpha " + i])[0],
+                             chunk_index=0) for i in ids]
+    tenant_store.add_chunks(rows(["k1", "k2"]), tenant_scope="tenant-A")
+    tenant_store.add_chunks(rows(["k1"]), tenant_scope="tenant-B")
+    assert tenant_store.document_ids("/data", tenant_scope="tenant-A") == ["/data/doc.md"]
+    assert tenant_store.prune_document("/data/doc.md", ["k1"], tenant_scope="tenant-A") == 1
+    assert tenant_store.prune_document("/data/doc.md", [], tenant_scope="tenant-A") == 1
+    assert tenant_store.count(tenant_scope="tenant-B") == 1
+
+
+def test_pg_a_row_owned_by_another_scope_is_never_replaced(tenant_store, embedder):
+    from redevops_rag.tenancy import qualify_id
+
+    tenant_store.add_chunks(_tenant_rows(embedder, "r", 1, "alpha original"), tenant_scope="tenant-A")
+    with tenant_store.con.cursor() as cur:                    # corrupt state: the stored id now belongs to another scope
+        cur.execute(f"UPDATE {tenant_store._qtable} SET tenant_scope = 'tenant-X'")
+    tenant_store.con.commit()
+    from redevops_rag.tenancy import TenantScopeError
+    with pytest.raises(TenantScopeError):
+        tenant_store.add_chunks(_tenant_rows(embedder, "r", 1, "re-ingest by A"), tenant_scope="tenant-A")
+    with tenant_store.con.cursor() as cur:
+        cur.execute(f"SELECT text, tenant_scope FROM {tenant_store._qtable} WHERE id = %s", [qualify_id("tenant-A", "r0")])
+        assert cur.fetchone() == ("alpha original", "tenant-X")

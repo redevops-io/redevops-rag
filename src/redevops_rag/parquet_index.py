@@ -161,6 +161,21 @@ def write_chunks_with_embeddings(chunks: "pl.DataFrame", uri: str, embedder, *, 
     return uri
 
 
+TENANT_COL = "tenant_scope"
+
+
+def scope_chunks(chunks: "pl.LazyFrame", tenant_scope: str) -> "pl.LazyFrame":
+    """``chunks`` restricted to one tenant. Apply it to the frame **before** calling any search function here: every
+    ranking, BM25 statistic, graph and closure is then computed inside the tenant (filter before top-k). Raises
+    :class:`~redevops_rag.tenancy.TenantScopeError` for an invalid scope or a frame with no ``tenant_scope`` column
+    (an untagged index cannot be scoped, so it is refused rather than returned whole)."""
+    from .tenancy import TenantScopeError, validate_tenant_scope
+    validate_tenant_scope(tenant_scope)
+    if TENANT_COL not in chunks.collect_schema().names():
+        raise TenantScopeError(f"index has no {TENANT_COL!r} column; it cannot be tenant-scoped")
+    return chunks.filter(pl.col(TENANT_COL) == tenant_scope)
+
+
 def _embedding_matrix(chunks: "pl.LazyFrame", docs: Optional[Iterable[str]]):
     lf = chunks.select("doc", "node", "embedding")
     if docs is not None:
