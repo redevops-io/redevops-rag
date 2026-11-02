@@ -157,7 +157,7 @@ def write_chunks_with_embeddings(chunks: "pl.DataFrame", uri: str, embedder, *, 
     with tempfile.TemporaryDirectory() as td:               # Polars -> Parquet -> DuckDB COPY: no pyarrow dependency
         stage = os.path.join(td, "stage.parquet")
         df.write_parquet(stage)
-        con.execute(f"COPY (SELECT * FROM read_parquet('{stage}')) TO '{uri}' (FORMAT PARQUET)")
+        con.execute(f"COPY (SELECT * FROM read_parquet({_sql_str(stage)})) TO {_sql_str(uri)} (FORMAT PARQUET)")
     return uri
 
 
@@ -174,6 +174,15 @@ def scope_chunks(chunks: "pl.LazyFrame", tenant_scope: str) -> "pl.LazyFrame":
     if TENANT_COL not in chunks.collect_schema().names():
         raise TenantScopeError(f"index has no {TENANT_COL!r} column; it cannot be tenant-scoped")
     return chunks.filter(pl.col(TENANT_COL) == tenant_scope)
+
+
+def _sql_str(value: str) -> str:
+    """``value`` as a single-quoted SQL string literal, for the places DuckDB cannot take a bound parameter
+    (``COPY ... TO '<uri>'``). Single quotes are doubled; an embedded NUL is refused because it would silently
+    truncate the literal."""
+    if "\x00" in value:
+        raise ValueError("path contains a NUL byte")
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _embedding_matrix(chunks: "pl.LazyFrame", docs: Optional[Iterable[str]]):
@@ -199,19 +208,34 @@ def dense_search(chunks: "pl.LazyFrame", qvec, k: int = 10, *, docs: Optional[It
     return [ids[i] for i in order[:k] if sims[i] >= floor]
 
 
-def duckdb_dense_search(path: str, qvec, k: int = 10, *, docs: Optional[Iterable[str]] = None) -> list[str]:
-    """The same ranking computed by DuckDB over the Parquet in place (local, glob or s3://), using ``list_cosine_similarity``."""
+def duckdb_dense_search(path: str, qvec, k: int = 10, *, docs: Optional[Iterable[str]] = None,
+                       tenant_scope: Optional[str] = None) -> list[str]:
+    """The same ranking computed by DuckDB over the Parquet in place (local, glob or s3://), using ``list_cosine_similarity``.
+
+    The path and every value are bound parameters (never interpolated into the SQL text). ``docs`` is applied in the
+    ``WHERE`` clause, i.e. before ``ORDER BY ... LIMIT``; an empty ``docs`` selects nothing (as in :func:`dense_search`).
+    ``tenant_scope`` adds ``AND tenant_scope = ?`` in the same clause (the Parquet must have that column)."""
     import duckdb
+    if tenant_scope is not None:
+        from .tenancy import validate_tenant_scope
+        validate_tenant_scope(tenant_scope)
+    ds = None if docs is None else list(docs)
+    if ds is not None and not ds:
+        return []
     con = duckdb.connect()
     if path.startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs; CREATE SECRET (TYPE s3, PROVIDER credential_chain)")
-    where, params = "", [list(map(float, qvec)), k]
-    if docs is not None:
-        ds = list(docs)
-        where = f"WHERE doc IN ({','.join('?' * len(ds))})"; params = [list(map(float, qvec)), *ds, k]
-    rows = con.execute(f"SELECT doc, node FROM read_parquet('{path}') {where} "
+    conds, filt = [], []
+    if ds is not None:
+        conds.append(f"doc IN ({','.join('?' * len(ds))})"); filt += ds
+    if tenant_scope is not None:
+        conds.append(f"{TENANT_COL} = ?"); filt.append(tenant_scope)
+    where = f"WHERE {' AND '.join(conds)} " if conds else ""
+    # placeholder order in the statement text: path, [docs..., tenant], query vector, limit
+    params = [path, *filt, list(map(float, qvec)), int(k)]
+    rows = con.execute(f"SELECT doc, node FROM read_parquet(?) {where}"
                        f"ORDER BY list_cosine_similarity(embedding, ?::FLOAT[]) DESC, doc, node LIMIT ?",
-                       [params[0], *params[1:]] if where == "" else params).fetchall()
+                       params).fetchall()
     return [node_id(d, n) for d, n in rows]
 
 
