@@ -89,7 +89,7 @@ def test_a_scope_given_to_an_unscoped_store_is_applied_but_does_not_make_it_isol
 
 
 # ── fail closed ──────────────────────────────────────────────────────────────────────────────────────────────────
-BAD_SCOPES = [None, "tenant::A", "", "   ", " tenant-A", "tenant-A ", "*", "%", "ALL", "public", "tenant\x00A", "tenant\nA", 123, b"tenant-A",
+BAD_SCOPES = [None, "tenant::A", "e\u0301", "acme\u200b", "acme\u00a0x", "acme\ufeff", "a\ue000b", "", "   ", " tenant-A", "tenant-A ", "*", "%", "ALL", "public", "tenant\x00A", "tenant\nA", 123, b"tenant-A",
               ["tenant-A"], "x" * 257]
 
 

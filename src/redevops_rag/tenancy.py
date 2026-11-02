@@ -16,9 +16,11 @@ Context Runtime control plane, an API layer) must establish the identity and pas
 """
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
 MAX_SCOPE_LEN = 256
+_BAD_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}
 _RESERVED = {"*", "%", "all", "any", "none", "null", "public"}     # values that read as "everyone" or "nobody"
 
 
@@ -41,6 +43,12 @@ def validate_tenant_scope(scope: Any) -> str:
         raise TenantScopeError(f"tenant scope longer than {MAX_SCOPE_LEN} characters")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in scope):
         raise TenantScopeError("tenant scope contains control characters")
+    if any(unicodedata.category(ch) in _BAD_CATEGORIES for ch in scope):
+        raise TenantScopeError("tenant scope contains format, surrogate, private-use or unassigned characters")
+    if any(unicodedata.category(ch) == "Zs" and ch != " " for ch in scope):
+        raise TenantScopeError("tenant scope contains a non-ASCII space separator")
+    if unicodedata.normalize("NFC", scope) != scope:     # look-alike spellings of the same name must not be separate tenants
+        raise TenantScopeError("tenant scope is not Unicode NFC-normalised")
     if "::" in scope:       # the id separator: scope "a::b" + id "c" would qualify to the same id as scope "a" + id "b::c"
         raise TenantScopeError("tenant scope must not contain '::'")
     if scope.lower() in _RESERVED:
