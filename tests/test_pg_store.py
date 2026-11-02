@@ -201,6 +201,22 @@ class _StampEmbedder(_FakeEmbedder):
         return self.encode(texts)
 
 
+def test_meta_values_are_returned_as_the_driver_decoded_them(store):
+    # psycopg decodes JSONB itself: a stored JSON *string* must come back as that string, not be parsed again
+    # (a second json.loads raised JSONDecodeError for plain names and corrupted JSON-looking text).
+    looks_like_json = '{"looks": "like json"}'
+    store.set_meta(name="nemotron", n=3, f=0.5, flag=True, nothing=None, items=[1, "a"],
+                   nested={"k": {"x": 1}}, text=looks_like_json)
+    got = store.get_meta()
+    assert got["name"] == "nemotron"
+    assert got["n"] == 3 and got["f"] == 0.5 and got["flag"] is True
+    assert got["nothing"] is None and "nothing" in got
+    assert got["items"] == [1, "a"] and got["nested"] == {"k": {"x": 1}}
+    assert got["text"] == looks_like_json and isinstance(got["text"], str)
+    assert store.get_meta("name") == "nemotron"
+    assert store.get_meta("missing", "dflt") == "dflt"
+
+
 def test_meta_stamp_and_get(store):
     # _FakeEmbedder has no .backend → nothing stamped automatically; set_meta/get_meta still work.
     store.set_meta(backend="bge", model="bge-small", dim=32, lang="en")

@@ -55,6 +55,16 @@ def _valid_ident(name: str) -> str:
     return name
 
 
+
+def _meta_value(v: Any) -> Any:
+    """A ``<table>_meta.value`` JSONB cell as read back by the driver.
+
+    psycopg (2 and 3) already decodes JSONB into Python objects, so a stored JSON *string* such as
+    ``"nemotron"`` arrives as the plain ``str`` ``nemotron``. Running ``json.loads`` on it again raises
+    ``JSONDecodeError`` (and would corrupt a string that merely looks like JSON), so the value is returned
+    as delivered."""
+    return v
+
 class PgStore:
     """Postgres + pgvector store implementing the DuckDB Store interface."""
 
@@ -158,7 +168,7 @@ class PgStore:
                 rows = cur.fetchall()
         except Exception:
             return default if key is not None else {}
-        meta = {k: (json.loads(v) if isinstance(v, str) else v) for k, v in rows}
+        meta = {k: _meta_value(v) for k, v in rows}
         return meta.get(key, default) if key is not None else meta
 
     def _stamp_encoder(self) -> None:
@@ -388,7 +398,7 @@ def open_pg_store(conn_url: str, table: str = "redevops_rag_chunks",
             qmeta = f'"{schema}"."{name}"' if schema else f'"{name}"'
             with con.cursor() as cur:
                 cur.execute(f"SELECT key, value FROM {qmeta}")
-                meta = {k: (json.loads(v) if isinstance(v, str) else v) for k, v in cur.fetchall()}
+                meta = {k: _meta_value(v) for k, v in cur.fetchall()}
             backend, model = meta.get("backend"), meta.get("model")
         finally:
             con.close()
