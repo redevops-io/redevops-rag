@@ -276,3 +276,37 @@ def test_query_mode_uses_encode_queries():
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
             cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
         s.con.commit(); s.close()
+
+
+# ── explicit retrieval outcomes on Postgres ──────────────────────────────────────────────────────────────────────
+def test_pg_lexical_failure_is_reported_not_swallowed_and_does_not_poison_the_connection(store, embedder):
+    from redevops_rag.retrieval_result import BackendUnavailable, RetrievalStatus
+    from redevops_rag.retrieve import hybrid_search_result
+
+    store.add_chunks(_chunks(embedder, "vitamin d deficiency correlates with poor sleep"))
+    healthy = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert healthy.status is RetrievalStatus.COMPLETE
+
+    with store.con.cursor() as cur:                         # the sparse leg's column disappears
+        cur.execute(f"ALTER TABLE {store._qtable} DROP COLUMN text_tsv CASCADE")
+    store.con.commit()
+    with pytest.raises(BackendUnavailable):
+        store.bm25_search("vitamin", strict=True)
+    assert store.bm25_search("vitamin") == []               # legacy store API unchanged
+
+    r = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert r.status is RetrievalStatus.DEGRADED and r.hits
+    assert [l.name for l in r.failed_legs()] == ["bm25"] and "postgresql://" not in (r.failed_legs()[0].error or "")
+    # a failed statement must not leave the transaction aborted for the next call
+    again = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert again.status is RetrievalStatus.DEGRADED and again.hits
+
+
+def test_pg_vector_failure_does_not_poison_the_lexical_leg(store, embedder):
+    from redevops_rag.retrieval_result import RetrievalStatus
+    from redevops_rag.retrieve import hybrid_search_result
+
+    store.add_chunks(_chunks(embedder, "vitamin d deficiency correlates with poor sleep"))
+    store.embedder = type("Bad", (), {"dim": 32, "encode": lambda self, t: [[0.0] * 31 for _ in t]})()   # wrong dimension
+    r = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert r.status is RetrievalStatus.DEGRADED and r.hits and [l.name for l in r.failed_legs()] == ["vector"]

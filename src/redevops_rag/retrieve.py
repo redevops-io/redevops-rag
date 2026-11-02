@@ -7,11 +7,17 @@ from the multi-tenant workspace/SaaS shell — it operates on a single :class:`S
 """
 from __future__ import annotations
 
+import inspect
+import logging
 import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
-from .namespace import check_namespace
+from .namespace import NamespaceMismatch, check_namespace
+from .retrieval_result import (LegReport, RetrievalResult, RetrievalStatus, RetrievalUnavailable,
+                               redact)
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # avoid importing duckdb just to type-hint
     from .store import Store
@@ -47,20 +53,28 @@ def rrf_fuse(rankings: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str
     return out
 
 
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def _apply_score_boosts(
     query: str,
     candidates: list[dict[str, Any]],
     recency_half_life_days: float,
     keyword_boost_per_term: float,
     keyword_boost_cap: float,
+    now: Optional[datetime] = None,
 ) -> list[dict[str, Any]]:
-    """Recency (exponential decay by half-life) + keyword priors on RRF-scored candidates."""
+    """Recency (exponential decay by half-life) + keyword priors on RRF-scored candidates.
+
+    ``now`` is the evaluation time for the recency decay; ``None`` means the current wall clock. Pass a fixed value
+    for reproducible scoring (benchmarks, replays, as-of queries)."""
     if not candidates:
         return candidates
     do_recency = recency_half_life_days > 0
     do_keyword = keyword_boost_per_term > 0
     terms = {t for t in re.findall(r"\w+", query.lower()) if len(t) > 2} if do_keyword else set()
-    now = datetime.now(timezone.utc)
+    now = _aware(now) if now is not None else datetime.now(timezone.utc)
 
     for c in candidates:
         boost = 1.0
@@ -85,6 +99,76 @@ def _apply_score_boosts(
     return candidates
 
 
+def _run_leg(name: str, fn) -> tuple[list[dict[str, Any]], LegReport]:
+    """Run one retrieval leg; a failure becomes a LegReport(ok=False) with redacted text, never a silent ``[]``."""
+    try:
+        hits = fn()
+    except Exception as e:  # noqa: BLE001 — every backend error must surface as an explicit leg failure
+        return [], LegReport(name=name, ok=False, error=redact(f"{type(e).__name__}: {e}"))
+    return hits, LegReport(name=name, ok=True, n_hits=len(hits))
+
+
+def _supports_strict(fn) -> bool:
+    try:
+        return "strict" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def hybrid_search_result(
+    store: Store,
+    query: str,
+    limit: int = 8,
+    pool: int = 50,
+    vector_threshold: float | None = None,
+    recency_half_life_days: float = 90.0,
+    keyword_boost_per_term: float = 0.05,
+    keyword_boost_cap: float = 1.5,
+    reranker: Optional["Reranker"] = None,  # noqa: F821
+    document_ids: list | None = None,
+    query_mode: str = "auto",
+    namespace: str | None = None,
+    as_of: Optional[datetime] = None,
+) -> RetrievalResult:
+    """:func:`hybrid_search` with an explicit outcome (see :mod:`redevops_rag.retrieval_result`).
+
+    Never raises for a backend failure: a leg that cannot run is reported in ``result.legs`` and the status becomes
+    ``DEGRADED`` (one leg) or ``UNAVAILABLE`` (both). A namespace refusal is returned as ``DENIED``. ``as_of`` fixes the
+    evaluation time of the recency boost (default: the wall clock, recorded in ``result.as_of``)."""
+    now = _aware(as_of) if as_of is not None else datetime.now(timezone.utc)
+    try:
+        check_namespace(getattr(store, "namespace", None), namespace)
+    except NamespaceMismatch as e:
+        return RetrievalResult([], RetrievalStatus.DENIED, (), now, [redact(str(e))])
+    if not query or not query.strip():
+        return RetrievalResult([], RetrievalStatus.EMPTY, (), now, ["blank query"])
+
+    vector_hits, vleg = _run_leg("vector", lambda: store.semantic_search(
+        query, top_k=pool, threshold=vector_threshold, document_ids=document_ids, query_mode=query_mode))
+    notes: list[str] = []
+    if _supports_strict(store.bm25_search):
+        bm25_hits, lleg = _run_leg("bm25", lambda: store.bm25_search(query, limit=pool, document_ids=document_ids, strict=True))
+    else:
+        bm25_hits, lleg = _run_leg("bm25", lambda: store.bm25_search(query, limit=pool, document_ids=document_ids))
+        lleg = LegReport(lleg.name, lleg.ok, lleg.n_hits, lleg.error, checked=False)
+        notes.append("bm25 leg: this store cannot report failures, an empty list may hide an outage")
+    legs = (vleg, lleg)
+
+    if not vleg.ok and not lleg.ok:
+        return RetrievalResult([], RetrievalStatus.UNAVAILABLE, legs, now, notes)
+    fused = rrf_fuse([vector_hits, bm25_hits])
+    fused = _apply_score_boosts(query, fused, recency_half_life_days, keyword_boost_per_term, keyword_boost_cap, now=now)
+    fused = fused[:pool]
+    if reranker is not None and fused:
+        fused = reranker.rerank(query, fused)
+    hits = fused[:limit]
+    if not vleg.ok or not lleg.ok:
+        status = RetrievalStatus.DEGRADED
+    else:
+        status = RetrievalStatus.COMPLETE if hits else RetrievalStatus.EMPTY
+    return RetrievalResult(hits, status, legs, now, notes)
+
+
 def hybrid_search(
     store: Store,
     query: str,
@@ -98,6 +182,7 @@ def hybrid_search(
     document_ids: list | None = None,
     query_mode: str = "auto",
     namespace: str | None = None,
+    as_of: Optional[datetime] = None,
 ) -> list[dict[str, Any]]:
     """Vector + BM25 → RRF → recency/keyword boosts → optional cross-encoder rerank.
 
@@ -106,29 +191,24 @@ def hybrid_search(
     search to a document subset — used to build graduated-pollution candidate pools.
     ``query_mode`` controls the vector leg's query encoding for asymmetric encoders
     (``instruct``/``plain``/``auto``) — inert for a symmetric encoder like bge.
-    """
-    check_namespace(getattr(store, "namespace", None), namespace)
-    if not query or not query.strip():
-        return []
-    try:
-        vector_hits = store.semantic_search(query, top_k=pool, threshold=vector_threshold,
-                                            document_ids=document_ids, query_mode=query_mode)
-    except Exception:
-        vector_hits = []
-    try:
-        bm25_hits = store.bm25_search(query, limit=pool, document_ids=document_ids)
-    except Exception:
-        bm25_hits = []
-    if not vector_hits and not bm25_hits:
-        return []
-    fused = rrf_fuse([vector_hits, bm25_hits])
-    fused = _apply_score_boosts(
-        query, fused, recency_half_life_days, keyword_boost_per_term, keyword_boost_cap
-    )
-    fused = fused[:pool]
-    if reranker is not None and fused:
-        fused = reranker.rerank(query, fused)
-    return fused[:limit]
+    ``as_of`` fixes the time used by the recency boost (default: now).
+
+    List-returning compatibility wrapper over :func:`hybrid_search_result`:
+    a namespace refusal still raises :class:`NamespaceMismatch`; a *degraded* search (one leg down) logs a warning and
+    returns what the other leg found; if **no** leg could run it raises :class:`RetrievalUnavailable` instead of
+    returning ``[]`` (which would be indistinguishable from "nothing matches"). Use :func:`hybrid_search_result` to
+    inspect the outcome."""
+    res = hybrid_search_result(store, query, limit=limit, pool=pool, vector_threshold=vector_threshold,
+                               recency_half_life_days=recency_half_life_days, keyword_boost_per_term=keyword_boost_per_term,
+                               keyword_boost_cap=keyword_boost_cap, reranker=reranker, document_ids=document_ids,
+                               query_mode=query_mode, namespace=namespace, as_of=as_of)
+    if res.status is RetrievalStatus.DENIED:
+        raise NamespaceMismatch("request namespace does not match the namespace of this component")
+    if res.status is RetrievalStatus.UNAVAILABLE:
+        raise RetrievalUnavailable(res)
+    if res.status is RetrievalStatus.DEGRADED:
+        _log.warning("hybrid_search degraded: %s", "; ".join(f"{l.name} leg failed: {l.error}" for l in res.failed_legs()))
+    return res.hits
 
 
 # ─────────────────────────── DIVER-style reasoning retrieval ───────────────────────────

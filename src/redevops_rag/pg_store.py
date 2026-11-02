@@ -55,6 +55,8 @@ def _valid_ident(name: str) -> str:
     return name
 
 
+from .retrieval_result import BackendUnavailable, redact
+
 class PgStore:
     """Postgres + pgvector store implementing the DuckDB Store interface."""
 
@@ -281,6 +283,13 @@ class PgStore:
         vec = eq([text])[0] if (instruct and callable(eq)) else self.embedder.encode([text])[0]
         return list(vec)
 
+    def _rollback(self) -> None:
+        """Best-effort: clear an aborted transaction so one failed statement does not poison later ones."""
+        try:
+            self.con.rollback()
+        except Exception:
+            pass
+
     def semantic_search(
         self, text: str, top_k: int = 50, threshold: float | None = None,
         document_ids: list | None = None, query_mode: str = "auto",
@@ -294,23 +303,27 @@ class PgStore:
             scope = "AND document_id = ANY(%s) "
             params.append(list(document_ids))
         params += [q, int(top_k)]
-        with self.con.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT id, document_id, filename, chunk_index, content_hash, text, metadata,
-                       created_at, (1 - (embedding <=> %s::vector)) AS sim
-                FROM {self._qtable}
-                WHERE (1 - (embedding <=> %s::vector)) >= %s {scope}
-                ORDER BY embedding <=> %s::vector ASC
-                LIMIT %s
-                """,
-                params,
-            )
-            rows = cur.fetchall()
+        try:
+            with self.con.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, document_id, filename, chunk_index, content_hash, text, metadata,
+                           created_at, (1 - (embedding <=> %s::vector)) AS sim
+                    FROM {self._qtable}
+                    WHERE (1 - (embedding <=> %s::vector)) >= %s {scope}
+                    ORDER BY embedding <=> %s::vector ASC
+                    LIMIT %s
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
+        except Exception:
+            self._rollback()          # leave the connection usable for the other leg; the caller sees the error
+            raise
         return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
-                    document_ids: list | None = None) -> list[dict]:
+                    document_ids: list | None = None, *, strict: bool = False) -> list[dict]:
         """Sparse-leg search using tsvector + ts_rank_cd. Keeps the name
         ``bm25_search`` and the ``bm25_score`` result key so hybrid RRF
         fusion / boosts run unchanged."""
@@ -338,7 +351,10 @@ class PgStore:
                     params,
                 )
                 rows = cur.fetchall()
-        except Exception:
+        except Exception as e:
+            self._rollback()
+            if strict:
+                raise BackendUnavailable(f"bm25 query failed: {type(e).__name__}: {redact(e)}") from e
             return []
         return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
 

@@ -27,6 +27,8 @@ def _fts_ident(name: str) -> str:
     return name
 
 
+from .retrieval_result import BackendUnavailable, redact
+
 class Store:
     def __init__(self, embedder, db_path: str = ":memory:", *,
                  fts_stemmer: str = "porter", fts_stopwords: str = "english",
@@ -209,8 +211,14 @@ class Store:
         return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
-                    document_ids: list | None = None) -> list[dict]:
-        if not self._fts or not text.strip():
+                    document_ids: list | None = None, *, strict: bool = False) -> list[dict]:
+        """BM25 over the FTS index. ``strict=False`` (default, legacy) returns ``[]`` when the leg cannot run.
+        ``strict=True`` raises :class:`BackendUnavailable` instead, so a caller can tell "no match" from "no index"."""
+        if not text.strip():
+            return []
+        if not self._fts:
+            if strict:
+                raise BackendUnavailable("full-text search extension is not loaded")
             return []
         scope = ""
         params: list = [text]
@@ -227,7 +235,9 @@ class Store:
                    WHERE score IS NOT NULL {scope}ORDER BY score DESC LIMIT ?""",
                 params,
             ).fetchall()
-        except Exception:
+        except Exception as e:
+            if strict:
+                raise BackendUnavailable(f"bm25 query failed: {type(e).__name__}: {redact(e)}") from e
             return []
         return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
 
