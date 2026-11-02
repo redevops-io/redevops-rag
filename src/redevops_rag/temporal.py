@@ -116,17 +116,21 @@ class TemporalReasoningRetriever:
 
     def search(self, store, query: str, limit: int = 8, *, reranker=None,
                document_ids: list | None = None,
-               recency_half_life_days: float = 0.0) -> list[dict[str, Any]]:
+               recency_half_life_days: float = 0.0,
+               namespace: str | None = None, tenant_scope: str | None = None) -> list[dict[str, Any]]:
+        """``namespace`` / ``tenant_scope`` are forwarded to every retrieval call (required on a tenant-aware store)."""
         if self.reason_llm is None:
             return hybrid_search(store, query, limit=limit, pool=self.pool,
                                  document_ids=document_ids, reranker=reranker,
-                                 recency_half_life_days=recency_half_life_days)
+                                 recency_half_life_days=recency_half_life_days,
+                                 namespace=namespace, tenant_scope=tenant_scope)
         return diver_search(store, query, self.reason_llm, limit=limit, pool=self.pool,
                             n_subqueries=self.n_subqueries, reranker=reranker,
                             document_ids=document_ids,
-                            recency_half_life_days=recency_half_life_days)
+                            recency_half_life_days=recency_half_life_days,
+                            namespace=namespace, tenant_scope=tenant_scope)
 
-    def insert(self, store, docs, *, embedder=None, reindex: bool = True) -> int:
+    def insert(self, store, docs, *, embedder=None, reindex: bool = True, tenant_scope: str | None = None) -> int:
         """Incrementally add documents to the store DIVER retrieves over — NO index rebuild. DIVER is
         index-free (query-time expand → retrieve → rerank), so a new document is simply embedded and
         upserted, and the very next ``search`` sees it. This is the streaming/live-corpus update path
@@ -141,7 +145,8 @@ class TemporalReasoningRetriever:
             return 0
         for c, e in zip(chunks, emb.encode([c["text"] for c in chunks])):
             c["embedding"] = e
-        return store.add_chunks(chunks, reindex=reindex)
+        kw = {"tenant_scope": tenant_scope} if tenant_scope is not None else {}
+        return store.add_chunks(chunks, reindex=reindex, **kw)
 
     # callable form so it slots straight into a bandit arm's retrieve hook
     __call__ = search

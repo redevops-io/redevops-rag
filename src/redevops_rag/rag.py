@@ -7,7 +7,8 @@ from typing import Any
 
 from .embed import Embedder
 from .ingest import ingest as _ingest
-from .retrieve import hybrid_search
+from .retrieval_result import redact
+from .retrieve import hybrid_search, hybrid_search_result
 from .store import Store
 
 _ANSWER_SYSTEM = (
@@ -80,6 +81,12 @@ class RAG:
     def search(self, query: str, k: int = 8, **kw) -> list[dict[str, Any]]:
         return hybrid_search(self.store, query, limit=k, reranker=self.reranker, **kw)
 
+    def search_result(self, query: str, k: int = 8, **kw):
+        """Like :meth:`search` but returns the :class:`~redevops_rag.retrieval_result.RetrievalResult` — status
+        (COMPLETE / EMPTY / DEGRADED / UNAVAILABLE / DENIED), per-leg reports and the isolation mode — so an empty list can be
+        told apart from a failed backend."""
+        return hybrid_search_result(self.store, query, limit=k, reranker=self.reranker, **kw)
+
     def ask(self, query: str, k: int = 8, model: str | None = None, base_url: str | None = None,
             api_key: str | None = None, system: str | None = None,
             **search_kw) -> dict[str, Any]:
@@ -102,7 +109,7 @@ class RAG:
             )
             return {"answer": resp.choices[0].message.content, "context": context, "sources": hits}
         except Exception as e:
-            return {"answer": None, "error": str(e), "context": context, "sources": hits}
+            return {"answer": None, "error": redact(f"{type(e).__name__}: {e}"), "context": context, "sources": hits}
 
     def close(self) -> None:
         self.store.close()

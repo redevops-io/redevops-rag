@@ -7,6 +7,7 @@ extension and soft-fails to an empty sparse leg if it can't load.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -207,15 +208,26 @@ class Store:
             sql += " AND tenant_scope = ?"; params.append(scope)
         return [r[0] for r in self.con.execute(sql, params).fetchall()]
 
+    def tenant_tagged_rows(self) -> int:
+        """Rows that belong to a tenant scope. A non-zero count means this database holds tenant data, so opening it
+        unscoped (no ``tenant_scope``) must not be mistaken for a single-user corpus."""
+        if not self._has_tenant_column():
+            return 0
+        return int(self.con.execute("SELECT count(*) FROM chunks WHERE tenant_scope IS NOT NULL").fetchone()[0])
+
     def reindex_fts(self) -> None:
+        """Rebuild the FTS index over the whole table (a global administrative operation, not tenant-scoped). A failure is
+        logged and remembered in ``fts_index_error`` — a stale or missing index shows up as a DEGRADED lexical leg, not silence."""
         if not self._fts:
             return
         try:
             self.con.execute(
                 f"PRAGMA create_fts_index('chunks', 'id', 'text', "
                 f"stemmer='{self.fts_stemmer}', stopwords='{self.fts_stopwords}', overwrite=1)")
-        except Exception:
-            pass
+            self.fts_index_error = None
+        except Exception as e:
+            self.fts_index_error = f"{type(e).__name__}: {redact(e)}"
+            logging.getLogger(__name__).warning("FTS reindex failed (lexical search may be stale or empty): %s", self.fts_index_error)
 
     def _encode_query(self, text: str, query_mode: str) -> list[float]:
         """Encode a query, honouring an asymmetric encoder's query side.

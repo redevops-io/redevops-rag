@@ -1,7 +1,7 @@
 {
   "_comment": "Coverage release gate (RAILS-MEM-GPU-01 CI-01). A green pytest exit code is not enough: this lane must EXECUTE (not skip) the Postgres and Parquet suites and the tenant-isolation contract. Raise numbers when tests are added; lowering one needs a reviewed reason.",
   "lane": "full",
-  "min_collected": 195,
+  "min_collected": 204,
   "max_skipped": 0,
   "allowed_skips": [],
   "required_files": {
@@ -20,7 +20,8 @@
     "tests/test_maxsim.py": 7,
     "tests/test_nemo_retriever.py": 10,
     "tests/test_smoke.py": 3,
-    "tests/test_ci_coverage_gate.py": 5
+    "tests/test_ci_coverage_gate.py": 5,
+    "tests/test_phase_a_review_fixes.py": 9
   },
   "required_tests": [
     "test_meta_stamp_and_get",
@@ -38,6 +39,9 @@
     "test_the_contract_detects_a_store_that_forgets_to_filter",
     "test_scoped_scores_equal_a_standalone_index_of_just_that_tenants_rows",
     "test_vector_leg_down_is_degraded_and_names_the_leg",
-    "test_both_legs_down_is_unavailable_and_the_legacy_api_raises"
+    "test_both_legs_down_is_unavailable_and_the_legacy_api_raises",
+    "test_cli_refuses_to_open_tenant_data_unscoped",
+    "test_a_failing_reranker_is_a_reported_degradation_not_a_crash_or_silence",
+    "test_temporal_retriever_forwards_scope_to_search_and_insert"
   ]
 }

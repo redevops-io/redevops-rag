@@ -191,10 +191,18 @@ def hybrid_search_result(
     fused = rrf_fuse([vector_hits, bm25_hits])
     fused = _apply_score_boosts(query, fused, recency_half_life_days, keyword_boost_per_term, keyword_boost_cap, now=now)
     fused = fused[:pool]
+    rleg = None
     if reranker is not None and fused:
-        fused = reranker.rerank(query, fused)
+        try:
+            fused = reranker.rerank(query, fused)
+            rleg = LegReport("rerank", True, len(fused))
+        except Exception as e:  # noqa: BLE001 — a failed reranker is a reported degradation, not a crash and not silence
+            rleg = LegReport("rerank", False, 0, redact(f"{type(e).__name__}: {e}"))
+            notes.append("reranker failed: hits are in fused (un-reranked) order")
+    if rleg is not None:
+        legs = legs + (rleg,)
     hits = fused[:limit]
-    if not vleg.ok or not lleg.ok:
+    if not vleg.ok or not lleg.ok or (rleg is not None and not rleg.ok):
         status = RetrievalStatus.DEGRADED
     else:
         status = RetrievalStatus.COMPLETE if hits else RetrievalStatus.EMPTY
