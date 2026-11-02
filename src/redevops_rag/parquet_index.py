@@ -157,8 +157,17 @@ def write_chunks_with_embeddings(chunks: "pl.DataFrame", uri: str, embedder, *, 
     with tempfile.TemporaryDirectory() as td:               # Polars -> Parquet -> DuckDB COPY: no pyarrow dependency
         stage = os.path.join(td, "stage.parquet")
         df.write_parquet(stage)
-        con.execute(f"COPY (SELECT * FROM read_parquet('{stage}')) TO '{uri}' (FORMAT PARQUET)")
+        con.execute(f"COPY (SELECT * FROM read_parquet({_sql_str(stage)})) TO {_sql_str(uri)} (FORMAT PARQUET)")
     return uri
+
+
+def _sql_str(value: str) -> str:
+    """``value`` as a single-quoted SQL string literal, for the places DuckDB cannot take a bound parameter
+    (``COPY ... TO '<uri>'``). Single quotes are doubled; an embedded NUL is refused because it would silently
+    truncate the literal."""
+    if "\x00" in value:
+        raise ValueError("path contains a NUL byte")
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _embedding_matrix(chunks: "pl.LazyFrame", docs: Optional[Iterable[str]]):
@@ -185,18 +194,23 @@ def dense_search(chunks: "pl.LazyFrame", qvec, k: int = 10, *, docs: Optional[It
 
 
 def duckdb_dense_search(path: str, qvec, k: int = 10, *, docs: Optional[Iterable[str]] = None) -> list[str]:
-    """The same ranking computed by DuckDB over the Parquet in place (local, glob or s3://), using ``list_cosine_similarity``."""
+    """The same ranking computed by DuckDB over the Parquet in place (local, glob or s3://), using ``list_cosine_similarity``.
+
+    The path and every value are bound parameters (never interpolated into the SQL text). ``docs`` is applied in the
+    ``WHERE`` clause, i.e. before ``ORDER BY ... LIMIT``; an empty ``docs`` selects nothing (as in :func:`dense_search`)."""
     import duckdb
+    ds = None if docs is None else list(docs)
+    if ds is not None and not ds:
+        return []
     con = duckdb.connect()
     if path.startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs; CREATE SECRET (TYPE s3, PROVIDER credential_chain)")
-    where, params = "", [list(map(float, qvec)), k]
-    if docs is not None:
-        ds = list(docs)
-        where = f"WHERE doc IN ({','.join('?' * len(ds))})"; params = [list(map(float, qvec)), *ds, k]
-    rows = con.execute(f"SELECT doc, node FROM read_parquet('{path}') {where} "
+    where = "" if ds is None else f"WHERE doc IN ({','.join('?' * len(ds))}) "
+    # placeholder order in the statement text: path, [docs...], query vector, limit
+    params = [path, *(ds or []), list(map(float, qvec)), int(k)]
+    rows = con.execute(f"SELECT doc, node FROM read_parquet(?) {where}"
                        f"ORDER BY list_cosine_similarity(embedding, ?::FLOAT[]) DESC, doc, node LIMIT ?",
-                       [params[0], *params[1:]] if where == "" else params).fetchall()
+                       params).fetchall()
     return [node_id(d, n) for d, n in rows]
 
 
