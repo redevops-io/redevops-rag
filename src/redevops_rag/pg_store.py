@@ -55,6 +55,20 @@ def _valid_ident(name: str) -> str:
     return name
 
 
+from .retrieval_result import BackendUnavailable, redact
+from .tenancy import TenantScopeError, qualify_id, validate_tenant_scope
+
+
+def _meta_value(v: Any) -> Any:
+    """A ``<table>_meta.value`` JSONB cell as read back by the driver.
+
+    psycopg (2 and 3) already decodes JSONB into Python objects, so a stored JSON *string* such as
+    ``"nemotron"`` arrives as the plain ``str`` ``nemotron``. Running ``json.loads`` on it again raises
+    ``JSONDecodeError`` (and would corrupt a string that merely looks like JSON), so the value is returned
+    as delivered."""
+    return v
+
+
 class PgStore:
     """Postgres + pgvector store implementing the DuckDB Store interface."""
 
@@ -65,8 +79,10 @@ class PgStore:
         table: str = "redevops_rag_chunks",
         schema: str | None = None,
         namespace: str | None = None,
+        tenant_aware: bool = False,
     ) -> None:
         self.namespace = namespace
+        self.tenant_aware = bool(tenant_aware)   # see tenancy.py: True ⇒ every call needs a valid tenant_scope
         self.embedder = embedder
         self.dim = int(embedder.dim)
         self.table = _valid_ident(table)
@@ -110,6 +126,7 @@ class PgStore:
                     embedding    VECTOR({self.dim}),
                     metadata     JSONB,
                     created_at   TIMESTAMPTZ,
+                    tenant_scope TEXT,
                     text_tsv     TSVECTOR GENERATED ALWAYS AS
                                  (to_tsvector('english', coalesce(text, ''))) STORED
                 )
@@ -118,6 +135,12 @@ class PgStore:
             # Migrate a legacy corpus (built before content-addressed identity) in place.
             cur.execute(
                 f"ALTER TABLE {self._qtable} ADD COLUMN IF NOT EXISTS content_hash TEXT"
+            )
+            cur.execute(
+                f"ALTER TABLE {self._qtable} ADD COLUMN IF NOT EXISTS tenant_scope TEXT"
+            )
+            cur.execute(
+                f'CREATE INDEX IF NOT EXISTS "{self.table}_tenant_idx" ON {self._qtable} (tenant_scope)'
             )
             cur.execute(
                 f'CREATE INDEX IF NOT EXISTS "{self.table}_tsv_idx" '
@@ -158,7 +181,7 @@ class PgStore:
                 rows = cur.fetchall()
         except Exception:
             return default if key is not None else {}
-        meta = {k: (json.loads(v) if isinstance(v, str) else v) for k, v in rows}
+        meta = {k: _meta_value(v) for k, v in rows}
         return meta.get(key, default) if key is not None else meta
 
     def _stamp_encoder(self) -> None:
@@ -171,12 +194,32 @@ class PgStore:
                           or getattr(self.embedder, "model", None),
                           dim=self.dim)
 
+    def _scope(self, tenant_scope: str | None) -> str | None:
+        """Resolve the scope for a call. Tenant-aware: required and validated. Unscoped: optional (validated if given)."""
+        if tenant_scope is None:
+            if self.tenant_aware:
+                raise TenantScopeError("tenant-aware store: a tenant_scope is required")
+            return None
+        return validate_tenant_scope(tenant_scope)
+
     def add_chunks(
-        self, chunks: list[dict[str, Any]], reindex: bool = False,
+        self, chunks: list[dict[str, Any]], reindex: bool = False, *, tenant_scope: str | None = None,
     ) -> int:
+        call_scope = self._scope(tenant_scope) if (tenant_scope is not None or not self.tenant_aware) else None
         rows: list[tuple] = []
         for c in chunks:
+            row_scope = c.get("tenant_scope")
+            if row_scope is not None:
+                row_scope = validate_tenant_scope(row_scope)
+                if call_scope is not None and row_scope != call_scope:
+                    raise TenantScopeError("chunk tenant_scope differs from the call's tenant_scope")
+            else:
+                row_scope = call_scope
+            if self.tenant_aware and row_scope is None:
+                raise TenantScopeError("tenant-aware store: every chunk needs a tenant_scope")
             cid = c.get("id") or str(uuid.uuid4())
+            if self.tenant_aware:
+                cid = qualify_id(row_scope, cid)
             rows.append(
                 (
                     cid,
@@ -188,63 +231,86 @@ class PgStore:
                     c["embedding"],
                     json.dumps(c.get("metadata") or {}),
                     c.get("created_at") or datetime.now(timezone.utc),
+                    row_scope,
                 )
             )
         if not rows:
             return 0
-        with self.con.cursor() as cur:
-            cur.executemany(
-                f"""
-                INSERT INTO {self._qtable}
-                    (id, document_id, filename, chunk_index, content_hash, text,
-                     embedding, metadata, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-                ON CONFLICT (id) DO UPDATE SET
-                    document_id  = EXCLUDED.document_id,
-                    filename     = EXCLUDED.filename,
-                    chunk_index  = EXCLUDED.chunk_index,
-                    content_hash = EXCLUDED.content_hash,
-                    text         = EXCLUDED.text,
-                    embedding    = EXCLUDED.embedding,
-                    metadata     = EXCLUDED.metadata,
-                    created_at   = EXCLUDED.created_at
-                """,
-                rows,
-            )
+        # Tenant-aware: the upsert may only touch a row that already belongs to the same scope (defence in depth; the
+        # scope-qualified id already prevents a clash).
+        guard = (f"WHERE {self._qtable}.tenant_scope IS NOT DISTINCT FROM EXCLUDED.tenant_scope"
+                 if self.tenant_aware else "")
+        if self.tenant_aware:                # same behaviour as the DuckDB store: refuse loudly rather than skip silently
+            with self.con.cursor() as cur:
+                cur.execute(f"SELECT id, tenant_scope FROM {self._qtable} WHERE id = ANY(%s)", [[r[0] for r in rows]])
+                owner = dict(cur.fetchall())
+            self.con.rollback()              # end the read-only transaction
+            if any(r[0] in owner and owner[r[0]] != r[9] for r in rows):
+                raise TenantScopeError("refusing to overwrite a chunk that belongs to a different tenant scope")
+        try:
+            with self.con.cursor() as cur:
+                cur.executemany(
+                    f"""
+                    INSERT INTO {self._qtable}
+                        (id, document_id, filename, chunk_index, content_hash, text,
+                         embedding, metadata, created_at, tenant_scope)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        document_id  = EXCLUDED.document_id,
+                        filename     = EXCLUDED.filename,
+                        chunk_index  = EXCLUDED.chunk_index,
+                        content_hash = EXCLUDED.content_hash,
+                        text         = EXCLUDED.text,
+                        embedding    = EXCLUDED.embedding,
+                        metadata     = EXCLUDED.metadata,
+                        created_at   = EXCLUDED.created_at,
+                        tenant_scope = EXCLUDED.tenant_scope
+                    {guard}
+                    """,
+                    rows,
+                )
+        except Exception:
+            self._rollback()
+            raise
         self.con.commit()
         if reindex:
             self.reindex_fts()
         return len(rows)
 
-    def prune_document(self, document_id: str, keep_ids: list[str]) -> int:
+    def prune_document(self, document_id: str, keep_ids: list[str], *, tenant_scope: str | None = None) -> int:
         """Delete chunks of ``document_id`` whose id is NOT in ``keep_ids`` — the re-ingest sweep that
-        removes now-orphaned tail chunks / re-hashed content. Mirrors the DuckDB Store."""
-        keep = list(keep_ids)
+        removes now-orphaned tail chunks / re-hashed content. Mirrors the DuckDB Store.
+        Tenant-aware: only rows of ``tenant_scope`` are considered."""
+        scope = self._scope(tenant_scope)
+        keep = [qualify_id(scope, k) for k in keep_ids] if (self.tenant_aware and scope) else list(keep_ids)
+        where, base = "document_id = %s", [document_id]
+        if scope is not None:
+            where += " AND tenant_scope = %s"; base.append(scope)
         with self.con.cursor() as cur:
             if not keep:
-                cur.execute(f"SELECT count(*) FROM {self._qtable} WHERE document_id = %s", [document_id])
+                cur.execute(f"SELECT count(*) FROM {self._qtable} WHERE {where}", base)
                 removed = int(cur.fetchone()[0])
-                cur.execute(f"DELETE FROM {self._qtable} WHERE document_id = %s", [document_id])
+                cur.execute(f"DELETE FROM {self._qtable} WHERE {where}", base)
             else:
-                cur.execute(
-                    f"SELECT count(*) FROM {self._qtable} "
-                    f"WHERE document_id = %s AND NOT (id = ANY(%s))", [document_id, keep])
+                cur.execute(f"SELECT count(*) FROM {self._qtable} WHERE {where} AND NOT (id = ANY(%s))", [*base, keep])
                 removed = int(cur.fetchone()[0])
-                cur.execute(
-                    f"DELETE FROM {self._qtable} "
-                    f"WHERE document_id = %s AND NOT (id = ANY(%s))", [document_id, keep])
+                cur.execute(f"DELETE FROM {self._qtable} WHERE {where} AND NOT (id = ANY(%s))", [*base, keep])
         self.con.commit()
         return removed
 
-    def document_ids(self, root: str) -> list[str]:
-        """Distinct document ids equal to ``root`` or located under it. Mirrors the DuckDB Store."""
+    def document_ids(self, root: str, *, tenant_scope: str | None = None) -> list[str]:
+        """Distinct document ids equal to ``root`` or located under it. Mirrors the DuckDB Store.
+        Tenant-aware: only the caller's own documents are listed."""
         import os
+        scope = self._scope(tenant_scope)
         prefix = root.rstrip(os.sep) + os.sep
+        sql = (f"SELECT DISTINCT document_id FROM {self._qtable} "
+               f"WHERE (document_id = %s OR left(document_id, %s) = %s)")
+        params: list = [root, len(prefix), prefix]
+        if scope is not None:
+            sql += " AND tenant_scope = %s"; params.append(scope)
         with self.con.cursor() as cur:
-            cur.execute(
-                f"SELECT DISTINCT document_id FROM {self._qtable} "
-                f"WHERE document_id = %s OR left(document_id, %s) = %s",
-                [root, len(prefix), prefix])
+            cur.execute(sql, params)
             return [r[0] for r in cur.fetchall()]
 
     def reindex_fts(self) -> None:
@@ -281,10 +347,19 @@ class PgStore:
         vec = eq([text])[0] if (instruct and callable(eq)) else self.embedder.encode([text])[0]
         return list(vec)
 
+    def _rollback(self) -> None:
+        """Best-effort: clear an aborted transaction so one failed statement does not poison later ones."""
+        try:
+            self.con.rollback()
+        except Exception:
+            pass
+
     def semantic_search(
         self, text: str, top_k: int = 50, threshold: float | None = None,
         document_ids: list | None = None, query_mode: str = "auto",
+        tenant_scope: str | None = None,
     ) -> list[dict]:
+        scope_v = self._scope(tenant_scope)     # tenant-aware: required; filters in WHERE, before ORDER BY ... LIMIT
         if threshold is None:   # per-encoder floor (bge 0.4; compressed-sim Nemotron/ReasonIR 0.1)
             threshold = getattr(self.embedder, "sim_floor", 0.4)
         q = self._encode_query(text, query_mode)
@@ -293,27 +368,36 @@ class PgStore:
         if document_ids is not None:
             scope = "AND document_id = ANY(%s) "
             params.append(list(document_ids))
+        if scope_v is not None:
+            scope += "AND tenant_scope = %s "
+            params.append(scope_v)
         params += [q, int(top_k)]
-        with self.con.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT id, document_id, filename, chunk_index, content_hash, text, metadata,
-                       created_at, (1 - (embedding <=> %s::vector)) AS sim
-                FROM {self._qtable}
-                WHERE (1 - (embedding <=> %s::vector)) >= %s {scope}
-                ORDER BY embedding <=> %s::vector ASC
-                LIMIT %s
-                """,
-                params,
-            )
-            rows = cur.fetchall()
+        try:
+            with self.con.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, document_id, filename, chunk_index, content_hash, text, metadata,
+                           created_at, (1 - (embedding <=> %s::vector)) AS sim
+                    FROM {self._qtable}
+                    WHERE (1 - (embedding <=> %s::vector)) >= %s {scope}
+                    ORDER BY embedding <=> %s::vector ASC
+                    LIMIT %s
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
+        except Exception:
+            self._rollback()          # leave the connection usable for the other leg; the caller sees the error
+            raise
         return [self._row(r, "similarity", r[8], "vector") for r in rows]
 
     def bm25_search(self, text: str, limit: int = 50,
-                    document_ids: list | None = None) -> list[dict]:
+                    document_ids: list | None = None, *, strict: bool = False,
+                    tenant_scope: str | None = None) -> list[dict]:
         """Sparse-leg search using tsvector + ts_rank_cd. Keeps the name
         ``bm25_search`` and the ``bm25_score`` result key so hybrid RRF
         fusion / boosts run unchanged."""
+        scope_v = self._scope(tenant_scope)     # validated first, even for a blank query
         if not text.strip():
             return []
         scope = ""
@@ -321,6 +405,9 @@ class PgStore:
         if document_ids is not None:
             scope = "AND document_id = ANY(%s) "
             params.append(list(document_ids))
+        if scope_v is not None:
+            scope += "AND tenant_scope = %s "
+            params.append(scope_v)
         params.append(int(limit))
         try:
             with self.con.cursor() as cur:
@@ -338,7 +425,10 @@ class PgStore:
                     params,
                 )
                 rows = cur.fetchall()
-        except Exception:
+        except Exception as e:
+            self._rollback()
+            if strict:
+                raise BackendUnavailable(f"bm25 query failed: {type(e).__name__}: {redact(e)}") from e
             return []
         return [self._row(r, "bm25_score", r[8], "bm25") for r in rows]
 
@@ -363,9 +453,13 @@ class PgStore:
             "source_type": source,
         }
 
-    def count(self) -> int:
+    def count(self, *, tenant_scope: str | None = None) -> int:
+        scope = self._scope(tenant_scope)
         with self.con.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM {self._qtable}")
+            if scope is not None:
+                cur.execute(f"SELECT count(*) FROM {self._qtable} WHERE tenant_scope = %s", [scope])
+            else:
+                cur.execute(f"SELECT count(*) FROM {self._qtable}")
             return int(cur.fetchone()[0])
 
     def close(self) -> None:
@@ -373,13 +467,14 @@ class PgStore:
 
 
 def open_pg_store(conn_url: str, table: str = "redevops_rag_chunks",
-                  schema: str | None = None, embedder=None, **embed_kw) -> "PgStore":
+                  schema: str | None = None, embedder=None, *, namespace: str | None = None,
+                  tenant_aware: bool = False, **embed_kw) -> "PgStore":
     """Open an existing pgvector corpus with the encoder it was BUILT with (read from
     ``{table}_meta``). Mirrors :func:`redevops_rag.store.open_store`: a corpus embedded with
     Nemotron must be queried with Nemotron (matching space + dim). Pass ``embedder`` to override;
     a legacy table with no stamp falls back to the default (bge)."""
     if embedder is not None:
-        return PgStore(embedder, conn_url, table=table, schema=schema)
+        return PgStore(embedder, conn_url, table=table, schema=schema, namespace=namespace, tenant_aware=tenant_aware)
     backend = model = None
     try:  # peek at the stamp with a throwaway connection before building the (heavy) encoder
         con = psycopg.connect(conn_url, autocommit=True)
@@ -388,7 +483,7 @@ def open_pg_store(conn_url: str, table: str = "redevops_rag_chunks",
             qmeta = f'"{schema}"."{name}"' if schema else f'"{name}"'
             with con.cursor() as cur:
                 cur.execute(f"SELECT key, value FROM {qmeta}")
-                meta = {k: (json.loads(v) if isinstance(v, str) else v) for k, v in cur.fetchall()}
+                meta = {k: _meta_value(v) for k, v in cur.fetchall()}
             backend, model = meta.get("backend"), meta.get("model")
         finally:
             con.close()
@@ -398,4 +493,5 @@ def open_pg_store(conn_url: str, table: str = "redevops_rag_chunks",
     kw = dict(embed_kw)
     if model and backend in ("nemotron", "reasonir", "colpali", "colqwen"):
         kw.setdefault("model", model)
-    return PgStore(make_embedder(backend, **kw), conn_url, table=table, schema=schema)
+    return PgStore(make_embedder(backend, **kw), conn_url, table=table, schema=schema, namespace=namespace,
+                   tenant_aware=tenant_aware)

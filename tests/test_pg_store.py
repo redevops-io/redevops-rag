@@ -201,6 +201,22 @@ class _StampEmbedder(_FakeEmbedder):
         return self.encode(texts)
 
 
+def test_meta_values_are_returned_as_the_driver_decoded_them(store):
+    # psycopg decodes JSONB itself: a stored JSON *string* must come back as that string, not be parsed again
+    # (a second json.loads raised JSONDecodeError for plain names and corrupted JSON-looking text).
+    looks_like_json = '{"looks": "like json"}'
+    store.set_meta(name="nemotron", n=3, f=0.5, flag=True, nothing=None, items=[1, "a"],
+                   nested={"k": {"x": 1}}, text=looks_like_json)
+    got = store.get_meta()
+    assert got["name"] == "nemotron"
+    assert got["n"] == 3 and got["f"] == 0.5 and got["flag"] is True
+    assert got["nothing"] is None and "nothing" in got
+    assert got["items"] == [1, "a"] and got["nested"] == {"k": {"x": 1}}
+    assert got["text"] == looks_like_json and isinstance(got["text"], str)
+    assert store.get_meta("name") == "nemotron"
+    assert store.get_meta("missing", "dflt") == "dflt"
+
+
 def test_meta_stamp_and_get(store):
     # _FakeEmbedder has no .backend → nothing stamped automatically; set_meta/get_meta still work.
     store.set_meta(backend="bge", model="bge-small", dim=32, lang="en")
@@ -276,3 +292,134 @@ def test_query_mode_uses_encode_queries():
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
             cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
         s.con.commit(); s.close()
+
+
+# ── explicit retrieval outcomes on Postgres ──────────────────────────────────────────────────────────────────────
+def test_pg_lexical_failure_is_reported_not_swallowed_and_does_not_poison_the_connection(store, embedder):
+    from redevops_rag.retrieval_result import BackendUnavailable, RetrievalStatus
+    from redevops_rag.retrieve import hybrid_search_result
+
+    store.add_chunks(_chunks(embedder, "vitamin d deficiency correlates with poor sleep"))
+    healthy = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert healthy.status is RetrievalStatus.COMPLETE
+
+    with store.con.cursor() as cur:                         # the sparse leg's column disappears
+        cur.execute(f"ALTER TABLE {store._qtable} DROP COLUMN text_tsv CASCADE")
+    store.con.commit()
+    with pytest.raises(BackendUnavailable):
+        store.bm25_search("vitamin", strict=True)
+    assert store.bm25_search("vitamin") == []               # legacy store API unchanged
+
+    r = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert r.status is RetrievalStatus.DEGRADED and r.hits
+    assert [l.name for l in r.failed_legs()] == ["bm25"] and "postgresql://" not in (r.failed_legs()[0].error or "")
+    # a failed statement must not leave the transaction aborted for the next call
+    again = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert again.status is RetrievalStatus.DEGRADED and again.hits
+
+
+def test_pg_vector_failure_does_not_poison_the_lexical_leg(store, embedder):
+    from redevops_rag.retrieval_result import RetrievalStatus
+    from redevops_rag.retrieve import hybrid_search_result
+
+    store.add_chunks(_chunks(embedder, "vitamin d deficiency correlates with poor sleep"))
+    store.embedder = type("Bad", (), {"dim": 32, "encode": lambda self, t: [[0.0] * 31 for _ in t]})()   # wrong dimension
+    r = hybrid_search_result(store, "vitamin d deficiency", vector_threshold=-1.0)
+    assert r.status is RetrievalStatus.DEGRADED and r.hits and [l.name for l in r.failed_legs()] == ["vector"]
+
+
+# ── tenant-aware mode on Postgres (same contract as the DuckDB store) ─────────────────────────────────────────────
+@pytest.fixture
+def tenant_store(embedder):
+    from redevops_rag.pg_store import PgStore
+
+    table = f"rag_tenant_{uuid.uuid4().hex[:12]}"
+    s = PgStore(embedder, PG_URL, table=table, tenant_aware=True)
+    yield s
+    with s.con.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{table}_meta"')
+    s.con.commit()
+    s.close()
+
+
+def _tenant_rows(embedder, prefix, n, text):
+    return [dict(id=f"{prefix}{i}", document_id=f"{prefix}doc{i}", text=text, embedding=embedder.encode([text])[0], chunk_index=0)
+            for i in range(n)]
+
+
+def test_pg_tenant_aware_fails_closed_without_a_valid_scope(tenant_store, embedder):
+    from redevops_rag.retrieval_result import RetrievalStatus
+    from redevops_rag.retrieve import hybrid_search_result
+    from redevops_rag.tenancy import TenantScopeError
+
+    with pytest.raises(TenantScopeError):
+        tenant_store.add_chunks(_tenant_rows(embedder, "x", 1, "budget forecast"))
+    for bad in (None, "", "*", "a::b", 5):
+        r = hybrid_search_result(tenant_store, "budget forecast", tenant_scope=bad)
+        assert r.status is RetrievalStatus.DENIED and r.legs == () and r.isolation == "tenant_aware"
+        with pytest.raises(TenantScopeError):
+            tenant_store.bm25_search("budget", tenant_scope=bad)
+
+
+def test_pg_tenant_filter_applies_before_limit_in_both_legs_and_ids_do_not_collide(tenant_store, embedder):
+    from redevops_rag.retrieve import hybrid_search
+
+    # tenant-A: 20 strong matches that outrank tenant-B's single weaker one; same ids/doc ids across tenants
+    tenant_store.add_chunks(_tenant_rows(embedder, "r", 20, "quarterly budget forecast alpha alpha"), tenant_scope="tenant-A")
+    tenant_store.add_chunks(_tenant_rows(embedder, "r", 1, "quarterly budget forecast alpha alpha"), tenant_scope="tenant-B")
+    assert tenant_store.count(tenant_scope="tenant-A") == 20 and tenant_store.count(tenant_scope="tenant-B") == 1
+    for tenant in ("tenant-A", "tenant-B"):
+        for hits in (tenant_store.semantic_search("budget forecast", top_k=1, threshold=-1.0, tenant_scope=tenant),
+                     tenant_store.bm25_search("budget forecast", limit=1, tenant_scope=tenant),
+                     hybrid_search(tenant_store, "budget forecast", limit=1, pool=1, tenant_scope=tenant, vector_threshold=-1.0)):
+            assert len(hits) == 1 and hits[0]["chunk_id"].startswith(tenant + "::")
+    wide = hybrid_search(tenant_store, "budget", limit=100, pool=100, tenant_scope="tenant-B", vector_threshold=-1.0)
+    assert {h["chunk_id"] for h in wide} == {"tenant-B::r0"}
+
+
+def test_pg_prune_and_document_listing_are_confined_to_the_tenant(tenant_store, embedder):
+    rows = lambda ids: [dict(id=i, document_id="/data/doc.md", text="alpha " + i, embedding=embedder.encode(["alpha " + i])[0],
+                             chunk_index=0) for i in ids]
+    tenant_store.add_chunks(rows(["k1", "k2"]), tenant_scope="tenant-A")
+    tenant_store.add_chunks(rows(["k1"]), tenant_scope="tenant-B")
+    assert tenant_store.document_ids("/data", tenant_scope="tenant-A") == ["/data/doc.md"]
+    assert tenant_store.prune_document("/data/doc.md", ["k1"], tenant_scope="tenant-A") == 1
+    assert tenant_store.prune_document("/data/doc.md", [], tenant_scope="tenant-A") == 1
+    assert tenant_store.count(tenant_scope="tenant-B") == 1
+
+
+def test_pg_a_row_owned_by_another_scope_is_never_replaced(tenant_store, embedder):
+    from redevops_rag.tenancy import qualify_id
+
+    tenant_store.add_chunks(_tenant_rows(embedder, "r", 1, "alpha original"), tenant_scope="tenant-A")
+    with tenant_store.con.cursor() as cur:                    # corrupt state: the stored id now belongs to another scope
+        cur.execute(f"UPDATE {tenant_store._qtable} SET tenant_scope = 'tenant-X'")
+    tenant_store.con.commit()
+    from redevops_rag.tenancy import TenantScopeError
+    with pytest.raises(TenantScopeError):
+        tenant_store.add_chunks(_tenant_rows(embedder, "r", 1, "re-ingest by A"), tenant_scope="tenant-A")
+    with tenant_store.con.cursor() as cur:
+        cur.execute(f"SELECT text, tenant_scope FROM {tenant_store._qtable} WHERE id = %s", [qualify_id("tenant-A", "r0")])
+        assert cur.fetchone() == ("alpha original", "tenant-X")
+
+
+def test_pg_lexical_scores_do_not_depend_on_other_tenants_documents(embedder):
+    """ts_rank_cd is a per-document function (no corpus-wide IDF), so adding another tenant's rows cannot move a score."""
+    from redevops_rag.pg_store import PgStore
+
+    t1, t2 = (f"rag_bm25_{uuid.uuid4().hex[:10]}" for _ in range(2))
+    a, b = (PgStore(embedder, PG_URL, table=t, tenant_aware=True) for t in (t1, t2))
+    try:
+        rows = _tenant_rows(embedder, "r", 5, "quarterly budget forecast alpha alpha")
+        a.add_chunks([dict(r) for r in rows], tenant_scope="tenant-A")
+        b.add_chunks([dict(r) for r in rows], tenant_scope="tenant-A")
+        b.add_chunks(_tenant_rows(embedder, "z", 200, "budget forecast alpha budget forecast"), tenant_scope="tenant-Z")
+        sa = {h["chunk_id"]: h["bm25_score"] for h in a.bm25_search("budget forecast alpha", limit=100, tenant_scope="tenant-A")}
+        sb = {h["chunk_id"]: h["bm25_score"] for h in b.bm25_search("budget forecast alpha", limit=100, tenant_scope="tenant-A")}
+        assert sa and sa == sb
+    finally:
+        for s, t in ((a, t1), (b, t2)):
+            with s.con.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS "{t}"'); cur.execute(f'DROP TABLE IF EXISTS "{t}_meta"')
+            s.con.commit(); s.close()

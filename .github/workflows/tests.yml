@@ -13,6 +13,19 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # A live Postgres + pgvector, so tests/test_pg_store.py EXECUTES (it used to skip all of its tests here).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: rag
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      REDEVOPS_RAG_PG_TEST_URL: postgresql://postgres:ci@localhost:5432/rag
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,10 +34,13 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
-        # [pg] pulls psycopg/pgvector so the pg-store module imports; the 14 tests in
-        # tests/test_pg_store.py still skip because they need a live Postgres
-        # (REDEVOPS_RAG_PG_TEST_URL), which is deliberately not provided here.
-        # [rerank] (FlagEmbedding/torch) is not installed: the suite does not need it.
-        run: python -m pip install -e ".[pg]" pytest
+        # [pg]: psycopg/pgvector. [parquet]: polars, so tests/test_parquet_index.py executes instead of being
+        # skipped at import. [rerank] (FlagEmbedding/torch) is not installed: the suite does not need it.
+        run: python -m pip install -e ".[pg,parquet]" pytest
       - name: Test
-        run: pytest -q
+        run: pytest -q -rs --junitxml=junit.xml
+      - name: Coverage gate (the lane must have executed what it claims; a green exit code is not enough)
+        # Fails if the Postgres / Parquet / tenant-isolation suites were skipped, a required test did not pass,
+        # fewer tests were collected than ci/expected_tests.json demands, or any skip is not on its allow-list.
+        if: ${{ !cancelled() }}
+        run: python tools/check_test_coverage.py junit.xml ci/expected_tests.json
