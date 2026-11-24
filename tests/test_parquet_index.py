@@ -112,3 +112,25 @@ def test_hybrid_and_ppr_are_deterministic_and_bounded(emb_corpus):
     p = simgraph_ppr_search(lf, q, k=3, docs=["d1"], knn=2)
     assert p == simgraph_ppr_search(lf, q, k=3, docs=["d1"], knn=2) and len(set(p)) == 3
     assert rrf_ids([["a", "b"], ["b", "c"]])[0] == "b"
+
+
+def test_the_duckdb_search_honours_a_document_filter_like_the_in_memory_one(emb_corpus):
+    """The filter path had its parameters in the wrong order: every call with ``docs`` raised."""
+    lf, uri, e = emb_corpus
+    q = e.encode(["compliance with applicable laws"])[0]
+    for docs in (["d2"], ["d1"], ["d1", "d2"], ["no-such-document"]):
+        assert duckdb_dense_search(uri, q, k=4, docs=docs) == dense_search(lf, q, k=4, docs=docs), docs
+    assert duckdb_dense_search(uri, q, k=4, docs=[]) == [] == dense_search(lf, q, k=4, docs=[])
+    assert all(i.startswith("d2#") for i in duckdb_dense_search(uri, q, k=4, docs=["d2"]))
+
+
+def test_a_quote_in_a_path_is_part_of_the_path_not_of_the_sql(tmp_path, emb_corpus):
+    lf, _uri, e = emb_corpus
+    target = str(tmp_path / "it's a'; DROP TABLE x; --" / "chunks.parquet")
+    chunks = lf.drop("embedding").collect()
+    assert write_chunks_with_embeddings(chunks, target, e) == target and (tmp_path / "it's a'; DROP TABLE x; --" / "chunks.parquet").is_file()
+    q = e.encode(["compliance with applicable laws"])[0]
+    assert duckdb_dense_search(target, q, k=4) == dense_search(lf, q, k=4)
+    with pytest.raises(ValueError):
+        write_chunks_with_embeddings(chunks, str(tmp_path / "a") + "\x00b.parquet", e)
+

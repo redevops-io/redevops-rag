@@ -157,8 +157,17 @@ def write_chunks_with_embeddings(chunks: "pl.DataFrame", uri: str, embedder, *, 
     with tempfile.TemporaryDirectory() as td:               # Polars -> Parquet -> DuckDB COPY: no pyarrow dependency
         stage = os.path.join(td, "stage.parquet")
         df.write_parquet(stage)
-        con.execute(f"COPY (SELECT * FROM read_parquet('{stage}')) TO '{uri}' (FORMAT PARQUET)")
+        # The source is a bound parameter. The target of COPY cannot be one, so it is written as a string literal with its quotes doubled:
+        # a path is data, never SQL.
+        con.execute(f"COPY (SELECT * FROM read_parquet(?)) TO {_sql_literal(uri)} (FORMAT PARQUET)", [stage])
     return uri
+
+
+def _sql_literal(text: str) -> str:
+    """``text`` as a SQL string literal. Refuses a NUL, which no path has and no literal can carry."""
+    if "\x00" in text:
+        raise ValueError("a path cannot contain a NUL character")
+    return "'" + text.replace("'", "''") + "'"
 
 
 def _embedding_matrix(chunks: "pl.LazyFrame", docs: Optional[Iterable[str]]):
@@ -190,13 +199,17 @@ def duckdb_dense_search(path: str, qvec, k: int = 10, *, docs: Optional[Iterable
     con = duckdb.connect()
     if path.startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs; CREATE SECRET (TYPE s3, PROVIDER credential_chain)")
-    where, params = "", [list(map(float, qvec)), k]
+    q = list(map(float, qvec))
+    where, ds = "", []
     if docs is not None:
         ds = list(docs)
-        where = f"WHERE doc IN ({','.join('?' * len(ds))})"; params = [list(map(float, qvec)), *ds, k]
-    rows = con.execute(f"SELECT doc, node FROM read_parquet('{path}') {where} "
+        if not ds:
+            return []                                           # a filter that names no document matches nothing
+        where = f"WHERE doc IN ({','.join('?' * len(ds))})"
+    # Parameters in the order their placeholders appear: the file, the documents of the filter, the query vector, the limit.
+    rows = con.execute(f"SELECT doc, node FROM read_parquet(?) {where} "
                        f"ORDER BY list_cosine_similarity(embedding, ?::FLOAT[]) DESC, doc, node LIMIT ?",
-                       [params[0], *params[1:]] if where == "" else params).fetchall()
+                       [path, *ds, q, k]).fetchall()
     return [node_id(d, n) for d, n in rows]
 
 
