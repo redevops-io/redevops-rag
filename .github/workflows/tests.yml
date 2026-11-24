@@ -25,6 +25,10 @@ jobs:
         # tests/test_pg_store.py still skip because they need a live Postgres
         # (REDEVOPS_RAG_PG_TEST_URL), which is deliberately not provided here.
         # [rerank] (FlagEmbedding/torch) is not installed: the suite does not need it.
-        run: python -m pip install -e ".[pg]" pytest
+        # the parquet extra and numpy are needed by tests/test_parquet_index.py, which skips itself without polars: without them the
+        # Parquet and DuckDB search paths were never run here
+        run: python -m pip install -e ".[pg,parquet]" numpy pytest
       - name: Test
-        run: pytest -q
+        run: pytest -q -rs
+      - name: The Parquet index tests ran (they skip themselves when polars is missing)
+        run: pytest -q tests/test_parquet_index.py -rs | tee /tmp/parquet.out && ! grep -q "skipped" /tmp/parquet.out
