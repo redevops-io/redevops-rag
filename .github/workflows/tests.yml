@@ -29,6 +29,17 @@ jobs:
         # Parquet and DuckDB search paths were never run here
         run: python -m pip install -e ".[pg,parquet]" numpy pytest
       - name: Test
-        run: pytest -q -rs
+        run: pytest -q -rs --junitxml="$RUNNER_TEMP/rag-tests.xml"
+      - name: Report the run to the QA portfolio dashboard
+        # the default branch only (the dashboard shows its state, not every pull request's); failures are reported too; a dashboard
+        # outage never fails the build, and with no token (a fork) nothing is reported
+        if: ${{ always() && github.event_name == 'push' }}
+        uses: redevops-io/agentic-os/.github/actions/report-qa@v0.4.12
+        with:
+          junit: ${{ runner.temp }}/rag-tests.xml
+          project: redevops-rag
+          suite: unit
+          url: ${{ vars.QA_DASHBOARD_URL }}
+          token: ${{ secrets.QA_DASHBOARD_TOKEN }}
       - name: The Parquet index tests ran (they skip themselves when polars is missing)
         run: pytest -q tests/test_parquet_index.py -rs | tee /tmp/parquet.out && ! grep -q "skipped" /tmp/parquet.out
